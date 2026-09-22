@@ -8,6 +8,7 @@ import autocrack
 from autocrack import (
     AccessPoint,
     AuthorizationError,
+    NotRootError,
     ToolNotFoundError,
     WifiAuditor,
     build_parser,
@@ -16,6 +17,13 @@ from autocrack import (
     parse_monitor_interface,
     scan_has_handshake,
 )
+
+
+def _tools_present_runner(cmd, **kwargs):
+    """A runner where `which` finds every tool (for tests past preflight)."""
+    if cmd[0] == "which":
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"/usr/sbin/{cmd[1]}", stderr="")
+    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
 # A real `airodump-ng --output-format csv` dump (CRLF line endings, leading
 # spaces on every field) with two APs and one associated station.
@@ -128,6 +136,71 @@ def test_auditor_run_requires_explicit_authorization():
         auditor.run(bssid="AA:BB:CC:DD:EE:FF", channel="6", wordlist="/tmp/w.txt")
 
 
+def test_run_requires_root(tmp_path):
+    auditor = WifiAuditor(
+        interface="wlan0",
+        workdir=str(tmp_path),
+        authorized=True,
+        runner=_tools_present_runner,
+        euid_getter=lambda: 1000,  # not root
+    )
+
+    with pytest.raises(NotRootError, match="root"):
+        auditor.run(bssid="AA:BB:CC:DD:EE:FF", channel="6", wordlist="/tmp/w.txt")
+
+
+# --- interfering processes (check kill) -----------------------------------
+
+
+def test_enable_monitor_kills_interfering_processes_by_default():
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["airmon-ng", "start"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="on [phy0]wlan0mon)\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    WifiAuditor(interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner).enable_monitor()
+
+    assert ["airmon-ng", "check", "kill"] in calls
+
+
+def test_enable_monitor_can_skip_check_kill():
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["airmon-ng", "start"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="on [phy0]wlan0mon)\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    auditor = WifiAuditor(
+        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+    )
+    auditor.enable_monitor()
+
+    assert ["airmon-ng", "check", "kill"] not in calls
+
+
+# --- stale capture files --------------------------------------------------
+
+
+def test_scan_ignores_stale_csv_from_a_previous_run(tmp_path):
+    # A leftover dump from an earlier run must not be reported as this scan's
+    # result once the new scan finds nothing.
+    (tmp_path / "scan-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+
+    def runner(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 1)  # airodump ran, wrote nothing new
+
+    auditor = WifiAuditor(
+        interface="wlan0", workdir=str(tmp_path), authorized=True, runner=runner
+    )
+
+    assert auditor.scan(seconds=1) == []
+
+
 # --- preflight tool check -------------------------------------------------
 
 
@@ -236,6 +309,7 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
         runner=runner,
         popen=popen,
         sleep=lambda _s: None,
+        euid_getter=lambda: 0,  # pretend root
     )
 
     result = auditor.run(

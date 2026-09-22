@@ -70,15 +70,21 @@ sudo python3 autocrack.py \
 Without a `--bssid` or `--essid`, `autocrack` scans and then **prints the
 networks it saw and stops** — it will not attack every AP in range.
 
+Must be run as **root** (monitor mode, injection and `airmon-ng` all require it).
+
 ### What it does, step by step
 
-1. `airmon-ng start <iface>` — enable monitor mode (auto-detects the `…mon` vif).
-2. `airodump-ng` — timed scan; parse the CSV to resolve your target's BSSID/channel.
-3. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.
-4. `aireplay-ng --deauth` — short deauth bursts to make a client re-handshake,
+1. Verify it's running as root and that the aircrack-ng suite is installed.
+2. `airmon-ng check kill` — stop NetworkManager/wpa_supplicant so they can't
+   yank the radio off-channel (skip with `--no-check-kill`).
+3. `airmon-ng start <iface>` — enable monitor mode (auto-detects the `…mon` vif).
+4. `airodump-ng` — timed scan; parse the CSV to resolve your target's BSSID/channel
+   (skipped when you pass `--bssid`/`--channel`). Stale files from prior runs are cleared first.
+5. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.
+6. `aireplay-ng --deauth` — short deauth bursts to make a client re-handshake,
    polling the capture until the WPA 4-way handshake appears.
-5. `aircrack-ng -w <wordlist> -b <bssid> <cap>` — offline crack; prints the key.
-6. `airmon-ng stop` — tear monitor mode back down.
+7. `aircrack-ng -w <wordlist> -b <bssid> <cap>` — offline crack; prints the key.
+8. `airmon-ng stop` — tear monitor mode back down.
 
 ## Key options
 
@@ -92,6 +98,7 @@ networks it saw and stops** — it will not attack every AP in range.
 | `--scan-time` | Seconds to scan for APs (default 15) |
 | `--deauth-rounds` | Deauth/capture attempts before giving up (default 4) |
 | `--workdir` | Where capture files are written (default `/tmp/autocrack`) |
+| `--no-check-kill` | Don't run `airmon-ng check kill` (leave NetworkManager up) |
 
 ## Tests
 

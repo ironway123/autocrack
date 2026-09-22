@@ -23,6 +23,7 @@ this) and must be run as root.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -43,6 +44,10 @@ class AuthorizationError(AutocrackError):
 
 class ToolNotFoundError(AutocrackError):
     """Raised when a required aircrack-ng binary is not on PATH."""
+
+
+class NotRootError(AutocrackError):
+    """Raised when the run is not executed as root (monitor mode needs it)."""
 
 
 class MonitorModeError(AutocrackError):
@@ -168,14 +173,23 @@ class WifiAuditor:
         runner=subprocess.run,
         popen=subprocess.Popen,
         sleep=time.sleep,
+        euid_getter=os.geteuid,
+        check_kill: bool = True,
     ) -> None:
         self.interface = interface
         self.workdir = Path(workdir)
         self.authorized = authorized
+        self.check_kill = check_kill
         self._runner = runner
         self._popen = popen
         self._sleep = sleep
+        self._euid_getter = euid_getter
         self.monitor: str | None = None
+
+    def ensure_root(self) -> None:
+        """Monitor mode, injection, and airmon-ng all require root."""
+        if self._euid_getter() != 0:
+            raise NotRootError("autocrack must be run as root (e.g. with sudo).")
 
     def preflight(self) -> None:
         """Ensure every required aircrack-ng binary is installed."""
@@ -188,6 +202,10 @@ class WifiAuditor:
                 )
 
     def enable_monitor(self) -> str:
+        if self.check_kill:
+            # NetworkManager/wpa_supplicant fight airodump for the radio and
+            # yank it off the target channel; airmon-ng check kill stops them.
+            self._runner(["airmon-ng", "check", "kill"], capture_output=True, text=True)
         completed = self._runner(
             ["airmon-ng", "start", self.interface], capture_output=True, text=True
         )
@@ -203,6 +221,7 @@ class WifiAuditor:
 
     def scan(self, seconds: int = 15) -> list[AccessPoint]:
         """Run a timed airodump-ng scan and parse the discovered access points."""
+        self._clear_captures("scan")
         prefix = self.workdir / "scan"
         cmd = [
             "airodump-ng",
@@ -233,6 +252,7 @@ class WifiAuditor:
         deauth rounds are exhausted. Returns the capture path and whether a
         handshake was seen.
         """
+        self._clear_captures("handshake")
         prefix = self.workdir / "handshake"
         cap_path = self.workdir / "handshake-01.cap"
         captured = False
@@ -267,6 +287,15 @@ class WifiAuditor:
                 pass
         return cap_path, captured
 
+    def _clear_captures(self, prefix: str) -> None:
+        """Remove leftover files from a previous run so we never read stale
+        scan results or a stale handshake as if they were this run's."""
+        for stale in self.workdir.glob(f"{prefix}-*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
     def _handshake_present(self, cap_path: Path, bssid: str) -> bool:
         completed = self._runner(
             ["aircrack-ng", str(cap_path)], capture_output=True, text=True
@@ -281,13 +310,48 @@ class WifiAuditor:
         )
         return parse_crack_key(completed.stdout)
 
+    def _resolve_target(
+        self, bssid: str | None, channel: str | None, essid: str | None, scan_seconds: int
+    ) -> tuple[str, str, str | None]:
+        """Return the (bssid, channel, essid) to attack, scanning if needed.
+
+        Monitor mode must already be enabled (airodump can't scan a managed
+        interface). Refuses to pick a target on its own when several APs are in
+        range and none was named -- you choose what you're allowed to test.
+        """
+        if bssid:
+            if not channel:
+                raise AutocrackError("A channel is required when a BSSID is given.")
+            return bssid, channel, essid
+
+        print(f"[*] Scanning {scan_seconds}s on {self.monitor or self.interface} ...", file=sys.stderr)
+        access_points = self.scan(seconds=scan_seconds)
+        if not access_points:
+            raise AutocrackError("No access points found. Move closer or scan longer.")
+        if essid:
+            for ap in access_points:
+                if ap.essid == essid:
+                    return ap.bssid, ap.channel, ap.essid
+            raise AutocrackError(f"ESSID {essid!r} was not seen in the scan.")
+
+        listing = "\n".join(
+            f"    {ap.bssid}  ch {ap.channel:>3}  {ap.power:>4} dBm  {ap.privacy:<10} {ap.essid}"
+            for ap in access_points
+        )
+        raise AutocrackError(
+            "Several APs are in range; target one with a BSSID+channel or an "
+            "ESSID you own:\n" + listing
+        )
+
     def run(
         self,
-        bssid: str,
-        channel: str,
+        *,
         wordlist: str,
-        deauth_rounds: int = 4,
+        bssid: str | None = None,
+        channel: str | None = None,
         essid: str | None = None,
+        deauth_rounds: int = 4,
+        scan_seconds: int = 15,
     ) -> AuditResult:
         """Run the full automated pipeline against a single target you own."""
         if not self.authorized:
@@ -295,9 +359,12 @@ class WifiAuditor:
                 "Refusing to run without explicit authorization. Pass --authorized "
                 "only for a network you own or are permitted to test."
             )
+        self.ensure_root()
         self.preflight()
         self.enable_monitor()
         try:
+            bssid, channel, essid = self._resolve_target(bssid, channel, essid, scan_seconds)
+            print(f"[*] Target {bssid} (ch {channel}) — capturing handshake ...", file=sys.stderr)
             cap_path, captured = self.capture_handshake(
                 bssid, channel, deauth_rounds=deauth_rounds
             )
@@ -329,6 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--workdir", default="/tmp/autocrack", help="Directory for capture files"
     )
     parser.add_argument(
+        "--no-check-kill",
+        action="store_true",
+        help="Do not run `airmon-ng check kill` (leave NetworkManager running)",
+    )
+    parser.add_argument(
         "--authorized",
         action="store_true",
         help="Confirm you own or are permitted to test the target (required)",
@@ -336,36 +408,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _select_target(auditor: WifiAuditor, args) -> tuple[str, str, str | None]:
-    """Resolve the (bssid, channel, essid) to attack from args or a scan."""
-    if args.bssid:
-        if not args.channel:
-            raise AutocrackError("--channel is required when --bssid is given.")
-        return args.bssid, args.channel, args.essid
-
-    print(f"[*] Scanning for {args.scan_time}s on {auditor.interface} ...", file=sys.stderr)
-    access_points = auditor.scan(seconds=args.scan_time)
-    if not access_points:
-        raise AutocrackError("No access points found. Move closer or scan longer.")
-
-    if args.essid:
-        for ap in access_points:
-            if ap.essid == args.essid:
-                return ap.bssid, ap.channel, ap.essid
-        raise AutocrackError(f"ESSID {args.essid!r} not seen in scan.")
-
-    print("[!] Multiple APs found; pass --bssid/--channel or --essid to target one:", file=sys.stderr)
-    for ap in access_points:
-        print(f"    {ap.bssid}  ch {ap.channel:>3}  {ap.power:>4} dBm  {ap.privacy:<10} {ap.essid}", file=sys.stderr)
-    raise AutocrackError("Refusing to auto-attack every network in range; choose a target.")
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    auditor = WifiAuditor(
-        interface=args.interface, workdir=args.workdir, authorized=args.authorized
-    )
     if not args.authorized:
         print(
             "[!] Refusing to run without --authorized. Only test networks you own "
@@ -374,17 +419,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    auditor.workdir.mkdir(parents=True, exist_ok=True)
+    auditor = WifiAuditor(
+        interface=args.interface,
+        workdir=args.workdir,
+        authorized=args.authorized,
+        check_kill=not args.no_check_kill,
+    )
     try:
-        auditor.preflight()
-        bssid, channel, essid = _select_target(auditor, args)
-        print(f"[*] Target {bssid} (ch {channel}) — capturing handshake ...", file=sys.stderr)
+        auditor.workdir.mkdir(parents=True, exist_ok=True)
         result = auditor.run(
-            bssid=bssid,
-            channel=channel,
             wordlist=args.wordlist,
+            bssid=args.bssid,
+            channel=args.channel,
+            essid=args.essid,
             deauth_rounds=args.deauth_rounds,
-            essid=essid,
+            scan_seconds=args.scan_time,
         )
     except AutocrackError as exc:
         print(f"[!] {exc}", file=sys.stderr)
