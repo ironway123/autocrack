@@ -50,6 +50,10 @@ class NotRootError(AutocrackError):
     """Raised when the run is not executed as root (monitor mode needs it)."""
 
 
+class InterfaceNotFoundError(AutocrackError):
+    """Raised when the requested Wi-Fi interface does not exist."""
+
+
 class MonitorModeError(AutocrackError):
     """Raised when monitor mode could not be enabled."""
 
@@ -175,6 +179,7 @@ class WifiAuditor:
         sleep=time.sleep,
         euid_getter=os.geteuid,
         check_kill: bool = True,
+        net_sysfs: str = "/sys/class/net",
     ) -> None:
         self.interface = interface
         self.workdir = Path(workdir)
@@ -184,6 +189,7 @@ class WifiAuditor:
         self._popen = popen
         self._sleep = sleep
         self._euid_getter = euid_getter
+        self._net_sysfs = Path(net_sysfs)
         self.monitor: str | None = None
 
     def ensure_root(self) -> None:
@@ -192,7 +198,7 @@ class WifiAuditor:
             raise NotRootError("autocrack must be run as root (e.g. with sudo).")
 
     def preflight(self) -> None:
-        """Ensure every required aircrack-ng binary is installed."""
+        """Ensure the aircrack-ng suite is installed and the interface exists."""
         for tool in REQUIRED_TOOLS:
             completed = self._runner(["which", tool], capture_output=True, text=True)
             if completed.returncode != 0:
@@ -200,6 +206,13 @@ class WifiAuditor:
                     f"'{tool}' not found on PATH. Install the aircrack-ng suite "
                     f"(e.g. `sudo apt install aircrack-ng`)."
                 )
+        # Only enforce on a system that exposes sysfs (Linux); a no-op elsewhere.
+        if self._net_sysfs.exists() and not (self._net_sysfs / self.interface).exists():
+            raise InterfaceNotFoundError(
+                f"Interface '{self.interface}' not found. Plug in the adapter and "
+                f"check `iw dev` — on a Raspberry Pi the ALFA is usually wlan1 "
+                f"(wlan0 is the built-in Wi-Fi)."
+            )
 
     def enable_monitor(self) -> str:
         if self.check_kill:

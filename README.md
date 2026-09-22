@@ -47,6 +47,35 @@ The MT7610U is supported by mainline Linux, so no out-of-tree driver is
 normally needed. If `ip link` shows no `wlanN`, update your kernel/firmware
 (`sudo apt install firmware-misc-nonfree` on Debian) and re-plug.
 
+## Raspberry Pi
+
+A Pi (4/5, or a Zero 2 W) running Raspberry Pi OS or Kali is the recommended
+host. No code changes are needed — but four things bite people:
+
+1. **The ALFA is `wlan1`, not `wlan0`.** `wlan0` is the Pi's built-in Wi-Fi;
+   the AWUS036ACHM comes up as `wlan1`. Pass `--interface wlan1`. Confirm with
+   `iw dev` after plugging it in. (autocrack now fails preflight with a clear
+   message if you name an interface that doesn't exist.)
+2. **Don't SSH in over Wi-Fi.** autocrack runs `airmon-ng check kill` by
+   default, which stops NetworkManager/wpa_supplicant and **drops a Wi-Fi SSH
+   session**. Reach the Pi over **Ethernet** or a serial/HDMI console. If you
+   must stay on Wi-Fi, add `--no-check-kill` (the built-in radio may then
+   interfere with capture).
+3. **Firmware.** The MT7610U needs `mediatek/mt7610u.bin`. It's in
+   `firmware-misc-nonfree` / `linux-firmware` (present on current Pi OS). If
+   `wlan1` never appears: `sudo apt install -y firmware-misc-nonfree && sudo reboot`.
+   Verify the driver bound it: `sudo dmesg | grep -i mt76`.
+4. **Power.** The AWUS036ACHM is high-power; under injection it can brown out a
+   Pi. Use a **powered USB hub** or a strong PSU.
+
+Typical Pi run (over Ethernet):
+
+```bash
+sudo apt install -y aircrack-ng iw
+sudo python3 autocrack.py --interface wlan1 --essid <your-network> \
+    --wordlist /path/to/rockyou.txt --authorized
+```
+
 ## Usage
 
 Run as root (monitor mode requires it).

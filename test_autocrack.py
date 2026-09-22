@@ -8,6 +8,7 @@ import autocrack
 from autocrack import (
     AccessPoint,
     AuthorizationError,
+    InterfaceNotFoundError,
     MonitorModeError,
     NotRootError,
     ToolNotFoundError,
@@ -135,6 +136,36 @@ def test_auditor_run_requires_explicit_authorization():
 
     with pytest.raises(AuthorizationError):
         auditor.run(bssid="AA:BB:CC:DD:EE:FF", channel="6", wordlist="/tmp/w.txt")
+
+
+def test_preflight_raises_when_interface_does_not_exist(tmp_path):
+    # No wlanN under the (empty) sysfs dir -> clear error, not a cryptic
+    # airmon-ng failure (the classic wlan0-vs-wlan1 Pi mistake).
+    auditor = WifiAuditor(
+        interface="wlan1",
+        workdir=str(tmp_path),
+        authorized=True,
+        runner=_tools_present_runner,
+        net_sysfs=str(tmp_path / "netdev"),
+    )
+    (tmp_path / "netdev").mkdir()
+
+    with pytest.raises(InterfaceNotFoundError, match="wlan1"):
+        auditor.preflight()
+
+
+def test_preflight_accepts_existing_interface(tmp_path):
+    netdev = tmp_path / "netdev"
+    (netdev / "wlan1").mkdir(parents=True)
+    auditor = WifiAuditor(
+        interface="wlan1",
+        workdir=str(tmp_path),
+        authorized=True,
+        runner=_tools_present_runner,
+        net_sysfs=str(netdev),
+    )
+
+    auditor.preflight()  # should not raise
 
 
 def test_run_requires_root(tmp_path):
