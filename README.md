@@ -1,0 +1,107 @@
+# autocrack — automated aircrack-ng Wi-Fi audit (Linux)
+
+`autocrack` chains the [aircrack-ng](https://www.aircrack-ng.org/) suite into
+one automated run — monitor mode → scan → targeted handshake capture (with
+deauth) → offline crack — so you don't drive each tool by hand.
+
+> **Authorized use only.** Run this against a network you own or have explicit
+> written permission to test. Deauthentication and handshake capture against
+> networks you don't control are illegal in most places. The `--authorized`
+> flag is a speed bump, not permission.
+
+## Why this is Linux-only
+
+Wi-Fi monitor mode + packet injection **do not work on macOS** for USB adapters
+like the ALFA AWUS036ACHM (MediaTek MT7610U) — there is no such driver. On
+**Linux** the in-kernel `mt76x0u` driver gives that card full monitor mode and
+injection, so the aircrack-ng suite works against it out of the box. This tool
+automates that Linux workflow.
+
+### Hardware note for Apple Silicon Macs
+
+Passing a USB Wi-Fi adapter through to a Linux VM on an Apple Silicon Mac
+(M-series) is unreliable — Apple's Virtualization.framework doesn't do arbitrary
+USB passthrough, and QEMU `usb-host` passthrough of Wi-Fi NICs is flaky on ARM.
+Run this on a **separate Linux machine** instead: a Raspberry Pi 4/5 (Raspberry
+Pi OS or Kali), or any x86 box booting Kali Linux, with the ALFA plugged
+directly into it.
+
+## Setup (Debian / Ubuntu / Kali / Raspberry Pi OS)
+
+```bash
+# 1. Install the aircrack-ng suite
+sudo apt update && sudo apt install -y aircrack-ng
+
+# 2. Plug in the ALFA (AWUS036ACHM / MT7610U) and confirm the driver bound it
+ip link                       # look for a wlanN interface
+sudo dmesg | grep -i mt76     # should show mt76x0u claiming the device
+
+# 3. (Recommended) stop processes that fight for the radio
+sudo airmon-ng check kill
+
+# 4. A wordlist, e.g. rockyou
+#    Kali: /usr/share/wordlists/rockyou.txt.gz  (gunzip it first)
+```
+
+The MT7610U is supported by mainline Linux, so no out-of-tree driver is
+normally needed. If `ip link` shows no `wlanN`, update your kernel/firmware
+(`sudo apt install firmware-misc-nonfree` on Debian) and re-plug.
+
+## Usage
+
+Run as root (monitor mode requires it).
+
+```bash
+# Target a specific AP you own (no scan step)
+sudo python3 autocrack.py \
+    --interface wlan0 \
+    --bssid AA:BB:CC:DD:EE:FF --channel 6 \
+    --wordlist /path/to/rockyou.txt \
+    --authorized
+
+# Or scan first and target by network name
+sudo python3 autocrack.py \
+    --interface wlan0 \
+    --essid MyHomeNetwork \
+    --wordlist /path/to/rockyou.txt \
+    --authorized
+```
+
+Without a `--bssid` or `--essid`, `autocrack` scans and then **prints the
+networks it saw and stops** — it will not attack every AP in range.
+
+### What it does, step by step
+
+1. `airmon-ng start <iface>` — enable monitor mode (auto-detects the `…mon` vif).
+2. `airodump-ng` — timed scan; parse the CSV to resolve your target's BSSID/channel.
+3. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.
+4. `aireplay-ng --deauth` — short deauth bursts to make a client re-handshake,
+   polling the capture until the WPA 4-way handshake appears.
+5. `aircrack-ng -w <wordlist> -b <bssid> <cap>` — offline crack; prints the key.
+6. `airmon-ng stop` — tear monitor mode back down.
+
+## Key options
+
+| Flag | Meaning |
+|------|---------|
+| `--interface` | Wi-Fi interface (e.g. `wlan0`) — **required** |
+| `--wordlist` | Passphrase wordlist — **required** |
+| `--authorized` | Confirm you're permitted to test the target — **required to run** |
+| `--bssid` / `--channel` | Target AP directly, skipping the scan |
+| `--essid` | Resolve BSSID/channel from a scan by network name |
+| `--scan-time` | Seconds to scan for APs (default 15) |
+| `--deauth-rounds` | Deauth/capture attempts before giving up (default 4) |
+| `--workdir` | Where capture files are written (default `/tmp/autocrack`) |
+
+## Tests
+
+The orchestration and all output parsing are unit-tested with fake command
+runners (no radio needed), so the logic is verifiable anywhere:
+
+```bash
+python3 -m pytest test_autocrack.py -v
+```
+
+**Not covered by tests:** the live aircrack-ng integration itself. The tests
+prove the parsing and control flow; capturing a real handshake and cracking it
+must be validated on the Linux box with the ALFA attached.
