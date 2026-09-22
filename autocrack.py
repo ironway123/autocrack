@@ -209,10 +209,34 @@ class WifiAuditor:
         completed = self._runner(
             ["airmon-ng", "start", self.interface], capture_output=True, text=True
         )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise MonitorModeError(
+                f"airmon-ng could not enable monitor mode on {self.interface}: {detail}"
+            )
         self.monitor = parse_monitor_interface(completed.stdout, requested=self.interface)
         if not self.monitor:
             raise MonitorModeError(f"Could not enable monitor mode on {self.interface}.")
+        self._verify_monitor(self.monitor)
         return self.monitor
+
+    def _verify_monitor(self, iface: str) -> None:
+        """Confirm the interface is really in monitor mode.
+
+        airmon-ng can exit 0 without actually switching the card (busy driver,
+        rfkill, unsupported adapter), and `parse_monitor_interface` then falls
+        back to the requested name -- so verify with `iw` rather than trust it.
+        If `iw` isn't installed we trust airmon-ng's exit status.
+        """
+        try:
+            info = self._runner(["iw", "dev", iface, "info"], capture_output=True, text=True)
+        except FileNotFoundError:
+            return
+        if "type monitor" not in (info.stdout or "").lower():
+            raise MonitorModeError(
+                f"{iface} is not in monitor mode after airmon-ng start "
+                f"(check rfkill, or that the driver supports monitor mode)."
+            )
 
     def disable_monitor(self) -> None:
         if self.monitor:

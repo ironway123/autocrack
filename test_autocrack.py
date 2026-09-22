@@ -8,6 +8,7 @@ import autocrack
 from autocrack import (
     AccessPoint,
     AuthorizationError,
+    MonitorModeError,
     NotRootError,
     ToolNotFoundError,
     WifiAuditor,
@@ -159,6 +160,8 @@ def test_enable_monitor_kills_interfering_processes_by_default():
         calls.append(cmd)
         if cmd[:2] == ["airmon-ng", "start"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="on [phy0]wlan0mon)\n", stderr="")
+        if cmd[0] == "iw":
+            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     WifiAuditor(interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner).enable_monitor()
@@ -173,6 +176,8 @@ def test_enable_monitor_can_skip_check_kill():
         calls.append(cmd)
         if cmd[:2] == ["airmon-ng", "start"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="on [phy0]wlan0mon)\n", stderr="")
+        if cmd[0] == "iw":
+            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     auditor = WifiAuditor(
@@ -181,6 +186,51 @@ def test_enable_monitor_can_skip_check_kill():
     auditor.enable_monitor()
 
     assert ["airmon-ng", "check", "kill"] not in calls
+
+
+def test_enable_monitor_raises_when_airmon_ng_reports_failure():
+    def runner(cmd, **kwargs):
+        if cmd[:2] == ["airmon-ng", "start"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such interface")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    auditor = WifiAuditor(
+        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+    )
+    with pytest.raises(MonitorModeError):
+        auditor.enable_monitor()
+
+
+def test_enable_monitor_raises_when_interface_not_actually_in_monitor_mode():
+    # airmon-ng exits 0 and prints no vif line (claiming in-place switch), but
+    # iw shows the interface is still managed -> monitor mode really failed.
+    def runner(cmd, **kwargs):
+        if cmd[:2] == ["airmon-ng", "start"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="wlan0\n", stderr="")
+        if cmd[0] == "iw":
+            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype managed\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    auditor = WifiAuditor(
+        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+    )
+    with pytest.raises(MonitorModeError, match="monitor mode"):
+        auditor.enable_monitor()
+
+
+def test_enable_monitor_confirms_monitor_mode_via_iw():
+    def runner(cmd, **kwargs):
+        if cmd[:2] == ["airmon-ng", "start"]:
+            out = "(mac80211 monitor mode vif enabled for [phy0]wlan0 on [phy0]wlan0mon)\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        if cmd[0] == "iw":
+            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    auditor = WifiAuditor(
+        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+    )
+    assert auditor.enable_monitor() == "wlan0mon"
 
 
 # --- stale capture files --------------------------------------------------
@@ -281,6 +331,8 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
         if prog == "airmon-ng" and cmd[1] == "start":
             out = "(mac80211 monitor mode vif enabled for [phy0]wlan0 on [phy0]wlan0mon)\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        if prog == "iw":
+            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
         if prog == "airodump-ng" and "--output-format" in cmd:  # timed scan
             # Write the CSV where the tool expects it (prefix + "-01.csv").
             prefix = cmd[cmd.index("--write") + 1]
