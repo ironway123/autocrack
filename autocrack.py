@@ -133,6 +133,34 @@ def parse_monitor_interface(airmon_output: str, requested: str) -> str:
     return requested
 
 
+def parse_monitor_from_iw_dev(iw_output: str, prefer: str | None = None) -> str | None:
+    """Return the interface that `iw dev` reports as being in monitor mode.
+
+    This is the authoritative, driver-independent way to learn the monitor
+    interface after `airmon-ng start` -- some drivers (mt76 / ALFA) switch the
+    same interface in place (it stays `wlan1`), others create a `wlan1mon` vif.
+    `prefer` (the requested interface) breaks ties. Returns None when nothing
+    is in monitor mode.
+    """
+    monitors: list[str] = []
+    current: str | None = None
+    for raw in iw_output.splitlines():
+        line = raw.strip()
+        if line.startswith("Interface "):
+            current = line.split(None, 1)[1].strip()
+        elif line == "type monitor" and current:
+            monitors.append(current)
+    if not monitors:
+        return None
+    if prefer and prefer in monitors:
+        return prefer
+    if prefer:
+        for name in monitors:
+            if name.startswith(prefer) or prefer in name:
+                return name
+    return monitors[0]
+
+
 def scan_has_handshake(aircrack_output: str, bssid: str) -> bool:
     """True when `aircrack-ng <cap>` reports a captured handshake for bssid.
 
@@ -231,29 +259,27 @@ class WifiAuditor:
             raise MonitorModeError(
                 f"airmon-ng could not enable monitor mode on {self.interface}: {detail}"
             )
-        self.monitor = parse_monitor_interface(completed.stdout, requested=self.interface)
+        self.monitor = self._detect_monitor_interface(completed.stdout)
         if not self.monitor:
-            raise MonitorModeError(f"Could not enable monitor mode on {self.interface}.")
-        self._verify_monitor(self.monitor)
+            raise MonitorModeError(
+                f"No interface entered monitor mode after airmon-ng start on "
+                f"{self.interface} (check rfkill, or that the driver supports "
+                f"monitor mode)."
+            )
         return self.monitor
 
-    def _verify_monitor(self, iface: str) -> None:
-        """Confirm the interface is really in monitor mode.
+    def _detect_monitor_interface(self, airmon_stdout: str) -> str | None:
+        """Find the monitor interface authoritatively via `iw dev`.
 
-        airmon-ng can exit 0 without actually switching the card (busy driver,
-        rfkill, unsupported adapter), and `parse_monitor_interface` then falls
-        back to the requested name -- so verify with `iw` rather than trust it.
-        If `iw` isn't installed we trust airmon-ng's exit status.
+        Works whether the driver switched the card in place (name unchanged) or
+        created a `…mon` vif. If `iw` isn't installed, fall back to parsing
+        airmon-ng's own output.
         """
         try:
-            info = self._runner(["iw", "dev", iface, "info"], capture_output=True, text=True)
+            info = self._runner(["iw", "dev"], capture_output=True, text=True)
         except FileNotFoundError:
-            return
-        if "type monitor" not in (info.stdout or "").lower():
-            raise MonitorModeError(
-                f"{iface} is not in monitor mode after airmon-ng start "
-                f"(check rfkill, or that the driver supports monitor mode)."
-            )
+            return parse_monitor_interface(airmon_stdout, requested=self.interface)
+        return parse_monitor_from_iw_dev(info.stdout, prefer=self.interface)
 
     def disable_monitor(self) -> None:
         if self.monitor:

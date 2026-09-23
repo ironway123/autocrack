@@ -118,9 +118,10 @@ milestones, which is what non-interactive/scripted runs get automatically.
 1. Verify it's running as root and that the aircrack-ng suite is installed.
 2. `airmon-ng check kill` — stop NetworkManager/wpa_supplicant so they can't
    yank the radio off-channel (skip with `--no-check-kill`).
-3. `airmon-ng start <iface>` — enable monitor mode (auto-detects the `…mon`
-   vif) and verify with `iw` that the card is really in monitor mode, failing
-   fast (rfkill / unsupported driver) instead of limping on.
+3. `airmon-ng start <iface>` — enable monitor mode, then read `iw dev` to find
+   the interface actually in monitor mode (works whether the driver switches
+   the card in place, e.g. mt76/ALFA keeps `wlan1`, or creates a `wlan1mon`
+   vif). Fails fast (rfkill / unsupported driver) instead of limping on.
 4. `airodump-ng` — timed scan; parse the CSV to resolve your target's BSSID/channel
    (skipped when you pass `--bssid`/`--channel`). Stale files from prior runs are cleared first.
 5. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.

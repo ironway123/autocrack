@@ -18,6 +18,7 @@ from autocrack import (
     build_parser,
     parse_airodump_csv,
     parse_crack_key,
+    parse_monitor_from_iw_dev,
     parse_monitor_interface,
     render_capture_status,
     render_scan_table,
@@ -215,7 +216,62 @@ def test_run_requires_root(tmp_path):
         auditor.run(bssid="AA:BB:CC:DD:EE:FF", channel="6", wordlist="/tmp/w.txt")
 
 
-# --- interfering processes (check kill) -----------------------------------
+# `iw dev` output samples --------------------------------------------------
+
+# mt76 / ALFA on a Pi: airmon-ng switches the SAME interface to monitor mode.
+IW_DEV_IN_PLACE = "phy#10\n\tInterface wlan1\n\t\tifindex 5\n\t\ttype monitor\n"
+# Other drivers create a separate <iface>mon vif and leave the original managed.
+IW_DEV_MON_VIF = (
+    "phy#0\n\tInterface wlan0mon\n\t\ttype monitor\n"
+    "\tInterface wlan0\n\t\ttype managed\n"
+)
+IW_DEV_ALL_MANAGED = "phy#0\n\tInterface wlan0\n\t\ttype managed\n"
+
+
+def _monitor_runner(iw_dev_output, interface="wlan1", airmon_rc=0):
+    def runner(cmd, **kwargs):
+        if cmd[:2] == ["airmon-ng", "start"]:
+            return subprocess.CompletedProcess(cmd, airmon_rc, stdout="", stderr="err")
+        if cmd[:2] == ["iw", "dev"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=iw_dev_output, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return runner
+
+
+# --- parse_monitor_from_iw_dev --------------------------------------------
+
+
+def test_parse_monitor_from_iw_dev_finds_in_place_monitor_interface():
+    assert parse_monitor_from_iw_dev(IW_DEV_IN_PLACE, prefer="wlan1") == "wlan1"
+
+
+def test_parse_monitor_from_iw_dev_finds_created_vif():
+    assert parse_monitor_from_iw_dev(IW_DEV_MON_VIF, prefer="wlan0") == "wlan0mon"
+
+
+def test_parse_monitor_from_iw_dev_returns_none_when_nothing_in_monitor_mode():
+    assert parse_monitor_from_iw_dev(IW_DEV_ALL_MANAGED, prefer="wlan0") is None
+
+
+# --- enable_monitor (detects the monitor interface from `iw dev`) ----------
+
+
+def test_enable_monitor_detects_in_place_monitor_interface():
+    # Regression: mt76/ALFA keeps the name `wlan1`; must not mis-parse to "10".
+    auditor = WifiAuditor(
+        interface="wlan1", workdir="/tmp/x", authorized=True,
+        runner=_monitor_runner(IW_DEV_IN_PLACE, interface="wlan1"), check_kill=False,
+    )
+    assert auditor.enable_monitor() == "wlan1"
+
+
+def test_enable_monitor_detects_created_mon_vif():
+    auditor = WifiAuditor(
+        interface="wlan0", workdir="/tmp/x", authorized=True,
+        runner=_monitor_runner(IW_DEV_MON_VIF, interface="wlan0"), check_kill=False,
+    )
+    assert auditor.enable_monitor() == "wlan0mon"
 
 
 def test_enable_monitor_kills_interfering_processes_by_default():
@@ -223,13 +279,11 @@ def test_enable_monitor_kills_interfering_processes_by_default():
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        if cmd[:2] == ["airmon-ng", "start"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout="on [phy0]wlan0mon)\n", stderr="")
-        if cmd[0] == "iw":
-            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
+        if cmd[:2] == ["iw", "dev"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=IW_DEV_IN_PLACE, stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    WifiAuditor(interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner).enable_monitor()
+    WifiAuditor(interface="wlan1", workdir="/tmp/x", authorized=True, runner=runner).enable_monitor()
 
     assert ["airmon-ng", "check", "kill"] in calls
 
@@ -239,14 +293,12 @@ def test_enable_monitor_can_skip_check_kill():
 
     def runner(cmd, **kwargs):
         calls.append(cmd)
-        if cmd[:2] == ["airmon-ng", "start"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout="on [phy0]wlan0mon)\n", stderr="")
-        if cmd[0] == "iw":
-            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
+        if cmd[:2] == ["iw", "dev"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=IW_DEV_IN_PLACE, stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     auditor = WifiAuditor(
-        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+        interface="wlan1", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
     )
     auditor.enable_monitor()
 
@@ -254,48 +306,22 @@ def test_enable_monitor_can_skip_check_kill():
 
 
 def test_enable_monitor_raises_when_airmon_ng_reports_failure():
-    def runner(cmd, **kwargs):
-        if cmd[:2] == ["airmon-ng", "start"]:
-            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such interface")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
     auditor = WifiAuditor(
-        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+        interface="wlan1", workdir="/tmp/x", authorized=True,
+        runner=_monitor_runner(IW_DEV_ALL_MANAGED, airmon_rc=1), check_kill=False,
     )
     with pytest.raises(MonitorModeError):
         auditor.enable_monitor()
 
 
-def test_enable_monitor_raises_when_interface_not_actually_in_monitor_mode():
-    # airmon-ng exits 0 and prints no vif line (claiming in-place switch), but
-    # iw shows the interface is still managed -> monitor mode really failed.
-    def runner(cmd, **kwargs):
-        if cmd[:2] == ["airmon-ng", "start"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout="wlan0\n", stderr="")
-        if cmd[0] == "iw":
-            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype managed\n", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
+def test_enable_monitor_raises_when_no_interface_entered_monitor_mode():
+    # airmon-ng exits 0 but iw dev shows nothing in monitor mode.
     auditor = WifiAuditor(
-        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
+        interface="wlan0", workdir="/tmp/x", authorized=True,
+        runner=_monitor_runner(IW_DEV_ALL_MANAGED, interface="wlan0"), check_kill=False,
     )
     with pytest.raises(MonitorModeError, match="monitor mode"):
         auditor.enable_monitor()
-
-
-def test_enable_monitor_confirms_monitor_mode_via_iw():
-    def runner(cmd, **kwargs):
-        if cmd[:2] == ["airmon-ng", "start"]:
-            out = "(mac80211 monitor mode vif enabled for [phy0]wlan0 on [phy0]wlan0mon)\n"
-            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-        if cmd[0] == "iw":
-            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    auditor = WifiAuditor(
-        interface="wlan0", workdir="/tmp/x", authorized=True, runner=runner, check_kill=False
-    )
-    assert auditor.enable_monitor() == "wlan0mon"
 
 
 # --- stale capture files --------------------------------------------------
@@ -479,10 +505,10 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
         if prog == "which":
             return subprocess.CompletedProcess(cmd, 0, stdout=f"/usr/sbin/{cmd[1]}", stderr="")
         if prog == "airmon-ng" and cmd[1] == "start":
-            out = "(mac80211 monitor mode vif enabled for [phy0]wlan0 on [phy0]wlan0mon)\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["iw", "dev"]:
+            out = "phy#0\n\tInterface wlan1mon\n\t\ttype monitor\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-        if prog == "iw":
-            return subprocess.CompletedProcess(cmd, 0, stdout="\ttype monitor\n", stderr="")
         if prog == "airodump-ng" and "--output-format" in cmd:  # timed scan
             # Write the CSV where the tool expects it (prefix + "-01.csv").
             prefix = cmd[cmd.index("--write") + 1]
