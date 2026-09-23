@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import pathlib
 import subprocess
 
@@ -454,6 +455,56 @@ def test_render_ap_list_includes_every_ap():
     assert "11:22:33:44:55:66" in out and "CoffeeAP" in out
 
 
+# --- capture retention & hashcat export -----------------------------------
+
+
+def test_archive_capture_saves_pcap_and_exports_hashcat(tmp_path):
+    cap = tmp_path / "handshake-01.cap"
+    cap.write_bytes(b"pcap-bytes-with-eapol")
+    captures = tmp_path / "captures"
+
+    def runner(cmd, **kwargs):
+        if cmd[0] == "hcxpcapngtool":
+            out = cmd[cmd.index("-o") + 1]
+            pathlib.Path(out).write_text("WPA*02*deadbeef...")  # emulate conversion
+            return subprocess.CompletedProcess(cmd, 0, stdout="1 handshake(s) written", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True, runner=runner,
+        captures_dir=str(captures),
+        now=lambda: datetime.datetime(2026, 9, 23, 14, 30, 0),
+    )
+
+    saved, hc = auditor._archive_capture(cap, "AA:BB:CC:DD:EE:FF", "HomeLab")
+
+    assert saved and pathlib.Path(saved).exists() and saved.endswith(".cap")
+    assert "HomeLab" in saved and "AA-BB-CC-DD-EE-FF" in saved  # BSSID + ESSID in name
+    assert "20260923-143000" in saved                            # timestamped
+    assert pathlib.Path(saved).read_bytes() == b"pcap-bytes-with-eapol"
+    assert hc and pathlib.Path(hc).exists() and hc.endswith(".hc22000")
+
+
+def test_archive_capture_skips_hashcat_when_tool_missing(tmp_path):
+    cap = tmp_path / "handshake-01.cap"
+    cap.write_bytes(b"pcap")
+
+    def runner(cmd, **kwargs):
+        if cmd[0] == "hcxpcapngtool":
+            raise FileNotFoundError("hcxpcapngtool not installed")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True, runner=runner,
+        captures_dir=str(tmp_path / "captures"),
+    )
+
+    saved, hc = auditor._archive_capture(cap, "AA:BB:CC:DD:EE:FF", "HomeLab")
+
+    assert saved and pathlib.Path(saved).exists()  # pcap still retained
+    assert hc is None                              # export gracefully skipped
+
+
 # --- live display rendering -----------------------------------------------
 
 
@@ -574,30 +625,44 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
             )
         if prog == "aircrack-ng":  # handshake presence check
             return subprocess.CompletedProcess(cmd, 0, stdout=next(handshake_checks), stderr="")
+        if prog == "hcxpcapngtool":
+            out = cmd[cmd.index("-o") + 1]
+            pathlib.Path(out).write_text("WPA*02*...")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if prog == "airmon-ng" and cmd[1] == "stop":
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     def popen(cmd, **kwargs):
         prefix = cmd[cmd.index("--write") + 1]
-        return _FakeProcess(f"{prefix}-01.cap")
+        # The targeted (pcap) airodump writes the handshake capture to disk.
+        if "handshake" in prefix:
+            pathlib.Path(f"{prefix}-01.cap").write_bytes(b"pcap-eapol")
+        return _FakeProcess()
 
+    captures = tmp_path / "captures"
     auditor = WifiAuditor(
-        interface="wlan0",
+        interface="wlan1",
         workdir=str(tmp_path),
         authorized=True,
         runner=runner,
         popen=popen,
         sleep=lambda _s: None,
         euid_getter=lambda: 0,  # pretend root
+        captures_dir=str(captures),
     )
 
     result = auditor.run(
-        bssid="AA:BB:CC:DD:EE:FF", channel="6", wordlist=str(wordlist), deauth_rounds=2
+        bssid="AA:BB:CC:DD:EE:FF", channel="6", essid="HomeLab",
+        wordlist=str(wordlist), deauth_rounds=2,
     )
 
     assert result.handshake_captured is True
     assert result.key == "correcthorse"
     # Monitor mode was enabled and then torn down.
-    assert ["airmon-ng", "start", "wlan0"] in calls
+    assert ["airmon-ng", "start", "wlan1"] in calls
     assert any(c[:2] == ["airmon-ng", "stop"] for c in calls)
+    # The capture was retained to the captures dir and exported for hashcat.
+    assert result.capture_path and pathlib.Path(result.capture_path).exists()
+    assert pathlib.Path(result.capture_path).parent == captures
+    assert result.hashcat_path and pathlib.Path(result.hashcat_path).exists()

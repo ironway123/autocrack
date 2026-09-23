@@ -136,8 +136,16 @@ milestones, which is what non-interactive/scripted runs get automatically.
 5. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.
 6. `aireplay-ng --deauth` — short deauth bursts to make a client re-handshake,
    polling the capture until the WPA 4-way handshake appears.
-7. `aircrack-ng -w <wordlist> -b <bssid> <cap>` — offline crack; prints the key.
-8. `airmon-ng stop` — tear monitor mode back down.
+7. Retain the capture: copy the pcap to `~/autocrack/captures/` as
+   `<essid>_<bssid>_<timestamp>.cap` (never clobbers a previous run), and, if
+   `hcxpcapngtool` (hcxtools) is installed, export the EAPOL to a hashcat
+   `.hc22000` next to it.
+8. `aircrack-ng -w <wordlist> -b <bssid> <cap>` — offline crack; prints the key.
+9. `airmon-ng stop` — tear monitor mode back down.
+
+Even when the passphrase isn't in your wordlist, the saved `.cap`/`.hc22000`
+let you crack it later with a bigger list or hashcat/GPU. For the export:
+`sudo apt install -y hcxtools`. Change the location with `--captures-dir`.
 
 ## Key options
 

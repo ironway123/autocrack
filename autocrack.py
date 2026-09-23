@@ -23,8 +23,10 @@ this) and must be run as root.
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -73,6 +75,8 @@ class AuditResult:
     essid: str | None
     handshake_captured: bool
     key: str | None
+    capture_path: str | None = None
+    hashcat_path: str | None = None
 
 
 # --- output parsing (pure, unit-tested) -----------------------------------
@@ -210,6 +214,8 @@ class WifiAuditor:
         net_sysfs: str = "/sys/class/net",
         clock=time.monotonic,
         refresh: float = 1.0,
+        captures_dir: str = "~/autocrack/captures",
+        now=datetime.datetime.now,
     ) -> None:
         self.interface = interface
         self.workdir = Path(workdir)
@@ -222,6 +228,8 @@ class WifiAuditor:
         self._net_sysfs = Path(net_sysfs)
         self._clock = clock
         self._refresh = refresh
+        self.captures_dir = Path(os.path.expanduser(captures_dir))
+        self._now = now
         self.monitor: str | None = None
 
     def ensure_root(self) -> None:
@@ -403,6 +411,43 @@ class WifiAuditor:
         )
         return scan_has_handshake(completed.stdout, bssid)
 
+    def _archive_capture(self, cap_path: Path, bssid: str, essid: str | None):
+        """Retain the handshake pcap under captures_dir and export it for hashcat.
+
+        Returns (saved_cap_path, hashcat_path) as strings, either possibly None.
+        The saved name is <essid>_<bssid>_<timestamp>.cap so runs never clobber
+        each other. Does nothing if the source capture doesn't exist.
+        """
+        if not cap_path.exists():
+            return None, None
+        self.captures_dir.mkdir(parents=True, exist_ok=True)
+        stamp = self._now().strftime("%Y%m%d-%H%M%S")
+        safe_essid = re.sub(r"[^A-Za-z0-9._-]+", "_", essid or "unknown").strip("_") or "unknown"
+        base = f"{safe_essid}_{bssid.replace(':', '-')}_{stamp}"
+        saved = self.captures_dir / f"{base}.cap"
+        shutil.copy2(cap_path, saved)
+        return str(saved), self._export_hashcat(saved)
+
+    def _export_hashcat(self, cap_path: Path) -> str | None:
+        """Convert the capture's EAPOL handshake to hashcat 22000 format.
+
+        Uses hcxpcapngtool (hcxtools). Returns the .hc22000 path, or None if the
+        tool isn't installed or produced nothing (export is best-effort — the
+        pcap is always kept regardless).
+        """
+        out = cap_path.with_suffix(".hc22000")
+        try:
+            completed = self._runner(
+                ["hcxpcapngtool", "-o", str(out), str(cap_path)],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return None
+        if completed.returncode != 0 or not out.exists():
+            return None
+        return str(out)
+
     def crack(self, cap_path: Path, bssid: str, wordlist: str) -> str | None:
         completed = self._runner(
             ["aircrack-ng", "-w", wordlist, "-b", bssid, str(cap_path)],
@@ -500,10 +545,16 @@ class WifiAuditor:
                 bssid, channel, deauth_rounds=deauth_rounds, essid=essid,
                 on_update=on_capture_update,
             )
+            saved_cap = hashcat_path = None
+            if captured:
+                saved_cap, hashcat_path = self._archive_capture(cap_path, bssid, essid)
             key = self.crack(cap_path, bssid, wordlist) if captured else None
         finally:
             self.disable_monitor()
-        return AuditResult(bssid=bssid, essid=essid, handshake_captured=captured, key=key)
+        return AuditResult(
+            bssid=bssid, essid=essid, handshake_captured=captured, key=key,
+            capture_path=saved_cap, hashcat_path=hashcat_path,
+        )
 
 
 # --- live display ---------------------------------------------------------
@@ -593,7 +644,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-time", type=int, default=15, help="Seconds to scan for APs")
     parser.add_argument("--deauth-rounds", type=int, default=4, help="Deauth/capture attempts")
     parser.add_argument(
-        "--workdir", default="/tmp/autocrack", help="Directory for capture files"
+        "--workdir", default="/tmp/autocrack", help="Scratch directory for in-progress capture files"
+    )
+    parser.add_argument(
+        "--captures-dir",
+        default="~/autocrack/captures",
+        help="Where to retain handshake pcaps and hashcat exports",
     )
     parser.add_argument(
         "--no-check-kill",
@@ -622,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         workdir=args.workdir,
         authorized=args.authorized,
         check_kill=not args.no_check_kill,
+        captures_dir=args.captures_dir,
     )
 
     live = (not args.quiet) and sys.stdout.isatty()
@@ -681,8 +738,17 @@ def main(argv: list[str] | None = None) -> int:
     if not result.handshake_captured:
         print("[-] No handshake captured. Try more deauth rounds or a busier time.")
         return 1
+
+    if result.capture_path:
+        print(f"[+] Handshake saved: {result.capture_path}")
+    if result.hashcat_path:
+        print(f"[+] Hashcat (22000): {result.hashcat_path}")
+    elif result.capture_path:
+        print("    (install hcxtools for a hashcat .hc22000 export)")
+
     if result.key is None:
-        print("[-] Handshake captured but passphrase not in wordlist.")
+        print("[-] Handshake captured but passphrase not in wordlist "
+              "(crack the saved capture later with a bigger list / hashcat).")
         return 1
     print(f"[+] KEY FOUND for {result.bssid}: {result.key}")
     return 0
