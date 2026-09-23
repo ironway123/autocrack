@@ -29,22 +29,23 @@ directly into it.
 ## Setup (Debian / Ubuntu / Kali / Raspberry Pi OS)
 
 ```bash
-# 1. Install the aircrack-ng suite
-sudo apt update && sudo apt install -y aircrack-ng iw
+# 1. One-shot install: dependencies + the `autocrack` command, system-wide
+./install.sh
+# Installs aircrack-ng, iw, hcxtools, then pip-installs autocrack (handling
+# Bookworm's PEP 668 automatically). Afterwards `sudo autocrack ...` works.
 
-# 2. Install autocrack itself (puts an `autocrack` command on PATH)
-sudo pip install .            # from the repo root; or `pip install --user .`
-
-# 3. Plug in the ALFA (AWUS036ACHM / MT7610U) and confirm the driver bound it
-ip link                       # look for a wlanN interface
+# 2. Plug in the ALFA (AWUS036ACHM / MT7610U) and confirm the driver bound it
+ip link                       # look for a wlanN interface (usually wlan1)
 sudo dmesg | grep -i mt76     # should show mt76x0u claiming the device
 
-# 3. (Recommended) stop processes that fight for the radio
-sudo airmon-ng check kill
-
-# 4. A wordlist, e.g. rockyou
+# 3. A wordlist, e.g. rockyou
 #    Kali: /usr/share/wordlists/rockyou.txt.gz  (gunzip it first)
 ```
+
+Prefer to do it by hand? Install the deps (`sudo apt install -y aircrack-ng iw
+hcxtools`) and then `sudo pip install --break-system-packages .` from the repo
+root (the `--break-system-packages` flag is what gets past Bookworm's PEP 668
+guard). Or skip installing entirely and run `sudo python3 autocrack.py ...`.
 
 The MT7610U is supported by mainline Linux, so no out-of-tree driver is
 normally needed. If `ip link` shows no `wlanN`, update your kernel/firmware
