@@ -442,14 +442,26 @@ class WifiAuditor:
                     return ap.bssid, ap.channel, ap.essid
             raise AutocrackError(f"ESSID {essid!r} was not seen in the scan.")
 
-        listing = "\n".join(
-            f"    {ap.bssid}  ch {ap.channel:>3}  {ap.power:>4} dBm  {ap.privacy:<10} {ap.essid}"
-            for ap in access_points
-        )
         raise AutocrackError(
             "Several APs are in range; target one with a BSSID+channel or an "
-            "ESSID you own:\n" + listing
+            "ESSID you own (or use --scan-only to just list them):\n"
+            + render_ap_list(access_points)
         )
+
+    def discover(self, scan_seconds: int = 15, on_update=None) -> list[AccessPoint]:
+        """Recon only: enable monitor mode, scan, and return nearby APs.
+
+        No target and no wordlist required, and no deauth/capture — this just
+        listens for beacons. Still needs root (monitor mode) and tears the
+        monitor interface back down afterwards.
+        """
+        self.ensure_root()
+        self.preflight()
+        self.enable_monitor()
+        try:
+            return self.scan(seconds=scan_seconds, on_update=on_update)
+        finally:
+            self.disable_monitor()
 
     def run(
         self,
@@ -510,6 +522,16 @@ def render_scan_table(access_points, elapsed, total) -> str:
     return "\n".join([header, cols, *rows])
 
 
+def render_ap_list(access_points) -> str:
+    """A plain, aligned table of discovered access points (for final output)."""
+    header = f"  {'BSSID':<17}  {'CH':>3}  {'PWR':>4}  {'PRIVACY':<12} ESSID"
+    rows = [
+        f"  {ap.bssid:<17}  {ap.channel:>3}  {ap.power:>4}  {ap.privacy:<12} {ap.essid}"
+        for ap in access_points
+    ]
+    return "\n".join([header, *rows])
+
+
 def render_capture_status(bssid, essid, elapsed, done, total, captured) -> str:
     """Render the live handshake-capture status block."""
     target = f"{bssid} ({essid})" if essid else bssid
@@ -559,7 +581,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--interface", required=True, help="Wi-Fi interface, e.g. wlan0")
-    parser.add_argument("--wordlist", required=True, help="Path to a passphrase wordlist")
+    parser.add_argument("--wordlist", help="Path to a passphrase wordlist (required unless --scan-only)")
+    parser.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Just scan and list nearby APs, then exit (no target, no capture)",
+    )
     parser.add_argument("--bssid", help="Target AP BSSID (skip interactive scan/select)")
     parser.add_argument("--channel", help="Target AP channel (required with --bssid)")
     parser.add_argument("--essid", help="Target AP ESSID (used to auto-resolve BSSID/channel)")
@@ -587,15 +614,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-
-    if not args.authorized:
-        print(
-            "[!] Refusing to run without --authorized. Only test networks you own "
-            "or are explicitly permitted to test.",
-            file=sys.stderr,
-        )
-        return 2
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     auditor = WifiAuditor(
         interface=args.interface,
@@ -610,6 +630,33 @@ def main(argv: list[str] | None = None) -> int:
     on_capture = lambda b, e, elapsed, done, total, got: display.update(
         render_capture_status(b, e, elapsed, done, total, got)
     )
+
+    # Recon mode: scan and list nearby APs, then exit. No target/wordlist/auth.
+    if args.scan_only:
+        try:
+            auditor.workdir.mkdir(parents=True, exist_ok=True)
+            aps = auditor.discover(scan_seconds=args.scan_time, on_update=on_scan)
+        except AutocrackError as exc:
+            print(f"[!] {exc}", file=sys.stderr)
+            return 1
+        finally:
+            display.finish()
+        if not aps:
+            print("No access points found. Move closer or scan longer.")
+            return 0
+        print(f"[+] {len(aps)} access point(s) found:")
+        print(render_ap_list(aps))
+        return 0
+
+    if not args.authorized:
+        print(
+            "[!] Refusing to run without --authorized. Only test networks you own "
+            "or are explicitly permitted to test.",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.wordlist:
+        parser.error("--wordlist is required (unless --scan-only)")
 
     try:
         auditor.workdir.mkdir(parents=True, exist_ok=True)

@@ -85,6 +85,9 @@ Run as root (monitor mode requires it). After `pip install .` you invoke it as
 `autocrack`; without installing, run `sudo python3 autocrack.py …` instead.
 
 ```bash
+# Recon only — scan and list nearby APs, then exit (no target/wordlist/auth)
+sudo autocrack --interface wlan1 --scan-only
+
 # Target a specific AP you own (no scan step)
 sudo autocrack \
     --interface wlan1 \
@@ -100,8 +103,14 @@ sudo autocrack \
     --authorized
 ```
 
-Without a `--bssid` or `--essid`, `autocrack` scans and then **prints the
-networks it saw and stops** — it will not attack every AP in range.
+Use `--scan-only` for **reconnaissance**: it enables monitor mode, scans, and
+prints a table of nearby APs (BSSID · channel · power · privacy · ESSID), then
+exits — no target, wordlist, or `--authorized` needed (it only listens for
+beacons). Pick a target from that list and re-run with `--bssid`/`--channel` or
+`--essid` to capture and crack.
+
+In the attack path, without a `--bssid` or `--essid`, `autocrack` scans and then
+**prints the networks it saw and stops** — it will not attack every AP in range.
 
 Must be run as **root** (monitor mode, injection and `airmon-ng` all require it).
 

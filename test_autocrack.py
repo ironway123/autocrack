@@ -20,6 +20,7 @@ from autocrack import (
     parse_crack_key,
     parse_monitor_from_iw_dev,
     parse_monitor_interface,
+    render_ap_list,
     render_capture_status,
     render_scan_table,
     scan_has_handshake,
@@ -400,6 +401,57 @@ def test_capture_handshake_reports_live_progress(tmp_path):
     assert captured is True
     assert frames  # progress was reported
     assert frames[-1][2] is True  # final frame shows the handshake captured
+
+
+# --- scan-only / AP discovery ---------------------------------------------
+
+
+def test_discover_enables_monitor_scans_and_returns_aps(tmp_path):
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "which":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"/usr/sbin/{cmd[1]}", stderr="")
+        if cmd[:2] == ["iw", "dev"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=IW_DEV_IN_PLACE, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def popen(cmd, **kwargs):
+        prefix = cmd[cmd.index("--write") + 1]
+        pathlib.Path(f"{prefix}-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1",
+        workdir=str(tmp_path),
+        authorized=False,  # recon/discovery does not require the attack gate
+        runner=runner,
+        popen=popen,
+        sleep=lambda _s: None,
+        clock=FakeClock(step=5),
+        euid_getter=lambda: 0,
+        net_sysfs=str(tmp_path / "no-sysfs"),  # absent -> interface check skipped
+    )
+
+    aps = auditor.discover(scan_seconds=15)
+
+    assert [ap.essid for ap in aps] == ["HomeLab", "CoffeeAP"]
+    assert ["airmon-ng", "start", "wlan1"] in calls
+    assert any(c[:2] == ["airmon-ng", "stop"] for c in calls)  # cleaned up
+
+
+def test_parser_scan_only_makes_wordlist_optional():
+    args = build_parser().parse_args(["--interface", "wlan1", "--scan-only"])
+    assert args.scan_only is True
+    assert args.wordlist is None
+
+
+def test_render_ap_list_includes_every_ap():
+    aps = parse_airodump_csv(SAMPLE_AIRODUMP_CSV)
+    out = render_ap_list(aps)
+    assert "AA:BB:CC:DD:EE:FF" in out and "HomeLab" in out
+    assert "11:22:33:44:55:66" in out and "CoffeeAP" in out
 
 
 # --- live display rendering -----------------------------------------------
