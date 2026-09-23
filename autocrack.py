@@ -344,6 +344,7 @@ class WifiAuditor:
         channel: str,
         deauth_rounds: int = 4,
         poll_seconds: int = 5,
+        deauth_count: int = 5,
         essid: str | None = None,
         on_update=None,
     ) -> tuple[Path, bool]:
@@ -375,7 +376,8 @@ class WifiAuditor:
         try:
             for round_index in range(deauth_rounds):
                 self._runner(
-                    ["aireplay-ng", "--deauth", "5", "-a", bssid, self.monitor or self.interface],
+                    ["aireplay-ng", "--deauth", str(deauth_count), "-a", bssid,
+                     self.monitor or self.interface],
                     capture_output=True,
                     text=True,
                 )
@@ -516,6 +518,7 @@ class WifiAuditor:
         channel: str | None = None,
         essid: str | None = None,
         deauth_rounds: int = 4,
+        deauth_count: int = 5,
         scan_seconds: int = 15,
         on_scan_update=None,
         on_capture_update=None,
@@ -542,8 +545,8 @@ class WifiAuditor:
             if verbose:
                 print(f"[*] Target {bssid} (ch {channel}) — capturing handshake ...", file=sys.stderr)
             cap_path, captured = self.capture_handshake(
-                bssid, channel, deauth_rounds=deauth_rounds, essid=essid,
-                on_update=on_capture_update,
+                bssid, channel, deauth_rounds=deauth_rounds, deauth_count=deauth_count,
+                essid=essid, on_update=on_capture_update,
             )
             saved_cap = hashcat_path = None
             if captured:
@@ -644,6 +647,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-time", type=int, default=15, help="Seconds to scan for APs")
     parser.add_argument("--deauth-rounds", type=int, default=4, help="Deauth/capture attempts")
     parser.add_argument(
+        "--deauth-count", type=int, default=5,
+        help="Deauth frames sent per round (aireplay-ng --deauth)",
+    )
+    parser.add_argument(
         "--workdir", default="/tmp/autocrack", help="Scratch directory for in-progress capture files"
     )
     parser.add_argument(
@@ -723,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
             channel=args.channel,
             essid=args.essid,
             deauth_rounds=args.deauth_rounds,
+            deauth_count=args.deauth_count,
             scan_seconds=args.scan_time,
             on_scan_update=on_scan,
             on_capture_update=on_capture,

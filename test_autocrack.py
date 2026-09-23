@@ -505,6 +505,31 @@ def test_archive_capture_skips_hashcat_when_tool_missing(tmp_path):
     assert hc is None                              # export gracefully skipped
 
 
+def test_capture_handshake_uses_configured_deauth_count(tmp_path):
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "aircrack-ng":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="AA:BB:CC:DD:EE:FF WPA (1 handshake)", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def popen(cmd, **kwargs):
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=runner, popen=popen, sleep=lambda _s: None,
+    )
+
+    auditor.capture_handshake("AA:BB:CC:DD:EE:FF", "6", deauth_rounds=1, deauth_count=12)
+
+    aireplay = next(c for c in calls if c and c[0] == "aireplay-ng")
+    assert aireplay[aireplay.index("--deauth") + 1] == "12"
+
+
 # --- live display rendering -----------------------------------------------
 
 

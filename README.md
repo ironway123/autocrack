@@ -158,6 +158,7 @@ let you crack it later with a bigger list or hashcat/GPU. For the export:
 | `--essid` | Resolve BSSID/channel from a scan by network name |
 | `--scan-time` | Seconds to scan for APs (default 15) |
 | `--deauth-rounds` | Deauth/capture attempts before giving up (default 4) |
+| `--deauth-count` | Deauth frames sent per round (default 5) |
 | `--workdir` | Where capture files are written (default `/tmp/autocrack`) |
 | `--no-check-kill` | Don't run `airmon-ng check kill` (leave NetworkManager up) |
 
