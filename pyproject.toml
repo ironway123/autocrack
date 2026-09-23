@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocrack"
+version = "0.1.0"
+description = "Automated aircrack-ng Wi-Fi audit workflow for authorized testing (Linux)"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "ironway123" }]
+keywords = ["aircrack-ng", "wifi", "security", "audit", "wpa"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+autocrack = "autocrack:main"
+
+[tool.setuptools]
+py-modules = ["autocrack"]
+
+[tool.pytest.ini_options]
+addopts = "-q"

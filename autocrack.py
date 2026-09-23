@@ -180,6 +180,8 @@ class WifiAuditor:
         euid_getter=os.geteuid,
         check_kill: bool = True,
         net_sysfs: str = "/sys/class/net",
+        clock=time.monotonic,
+        refresh: float = 1.0,
     ) -> None:
         self.interface = interface
         self.workdir = Path(workdir)
@@ -190,6 +192,8 @@ class WifiAuditor:
         self._sleep = sleep
         self._euid_getter = euid_getter
         self._net_sysfs = Path(net_sysfs)
+        self._clock = clock
+        self._refresh = refresh
         self.monitor: str | None = None
 
     def ensure_root(self) -> None:
@@ -256,21 +260,46 @@ class WifiAuditor:
             self._runner(["airmon-ng", "stop", self.monitor], capture_output=True, text=True)
             self.monitor = None
 
-    def scan(self, seconds: int = 15) -> list[AccessPoint]:
-        """Run a timed airodump-ng scan and parse the discovered access points."""
+    def scan(self, seconds: int = 15, on_update=None) -> list[AccessPoint]:
+        """Run a timed airodump-ng scan and parse the discovered access points.
+
+        airodump-ng runs in the background writing its CSV; we re-read it every
+        `refresh` seconds and, if `on_update(aps, elapsed, total)` is given,
+        stream the growing list to a live display.
+        """
         self._clear_captures("scan")
         prefix = self.workdir / "scan"
-        cmd = [
-            "airodump-ng",
-            "--write", str(prefix),
-            "--output-format", "csv",
-            self.monitor or self.interface,
-        ]
-        try:
-            self._runner(cmd, capture_output=True, text=True, timeout=seconds)
-        except subprocess.TimeoutExpired:
-            pass  # expected: airodump-ng runs until stopped.
         csv_path = self.workdir / "scan-01.csv"
+        dump = self._popen(
+            [
+                "airodump-ng",
+                "--write", str(prefix),
+                "--output-format", "csv",
+                self.monitor or self.interface,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        start = self._clock()
+        aps: list[AccessPoint] = []
+        try:
+            while self._clock() - start < seconds:
+                self._sleep(self._refresh)
+                aps = self._read_scan(csv_path)
+                if on_update is not None:
+                    on_update(aps, min(int(self._clock() - start), seconds), seconds)
+        finally:
+            dump.terminate()
+            try:
+                dump.wait(timeout=5)
+            except Exception:
+                pass
+        aps = self._read_scan(csv_path)
+        if on_update is not None:
+            on_update(aps, seconds, seconds)
+        return aps
+
+    def _read_scan(self, csv_path: Path) -> list[AccessPoint]:
         if not csv_path.exists():
             return []
         return parse_airodump_csv(csv_path.read_text(errors="replace"))
@@ -281,18 +310,22 @@ class WifiAuditor:
         channel: str,
         deauth_rounds: int = 4,
         poll_seconds: int = 5,
+        essid: str | None = None,
+        on_update=None,
     ) -> tuple[Path, bool]:
         """Capture a WPA handshake for bssid, nudging clients with deauths.
 
         Runs a targeted airodump-ng in the background, then alternates deauth
         bursts with handshake-presence checks until one is captured or the
         deauth rounds are exhausted. Returns the capture path and whether a
-        handshake was seen.
+        handshake was seen. If `on_update(elapsed, done, total, captured)` is
+        given, progress is streamed to a live display after each round.
         """
         self._clear_captures("handshake")
         prefix = self.workdir / "handshake"
         cap_path = self.workdir / "handshake-01.cap"
         captured = False
+        start = self._clock()
         dump = self._popen(
             [
                 "airodump-ng",
@@ -306,15 +339,20 @@ class WifiAuditor:
             stderr=subprocess.DEVNULL,
         )
         try:
-            for _ in range(deauth_rounds):
+            for round_index in range(deauth_rounds):
                 self._runner(
                     ["aireplay-ng", "--deauth", "5", "-a", bssid, self.monitor or self.interface],
                     capture_output=True,
                     text=True,
                 )
                 self._sleep(poll_seconds)
-                if self._handshake_present(cap_path, bssid):
-                    captured = True
+                captured = self._handshake_present(cap_path, bssid)
+                if on_update is not None:
+                    on_update(
+                        bssid, essid, int(self._clock() - start),
+                        round_index + 1, deauth_rounds, captured,
+                    )
+                if captured:
                     break
         finally:
             dump.terminate()
@@ -348,7 +386,13 @@ class WifiAuditor:
         return parse_crack_key(completed.stdout)
 
     def _resolve_target(
-        self, bssid: str | None, channel: str | None, essid: str | None, scan_seconds: int
+        self,
+        bssid: str | None,
+        channel: str | None,
+        essid: str | None,
+        scan_seconds: int,
+        on_scan_update=None,
+        verbose: bool = True,
     ) -> tuple[str, str, str | None]:
         """Return the (bssid, channel, essid) to attack, scanning if needed.
 
@@ -361,8 +405,9 @@ class WifiAuditor:
                 raise AutocrackError("A channel is required when a BSSID is given.")
             return bssid, channel, essid
 
-        print(f"[*] Scanning {scan_seconds}s on {self.monitor or self.interface} ...", file=sys.stderr)
-        access_points = self.scan(seconds=scan_seconds)
+        if verbose:
+            print(f"[*] Scanning {scan_seconds}s on {self.monitor or self.interface} ...", file=sys.stderr)
+        access_points = self.scan(seconds=scan_seconds, on_update=on_scan_update)
         if not access_points:
             raise AutocrackError("No access points found. Move closer or scan longer.")
         if essid:
@@ -389,8 +434,15 @@ class WifiAuditor:
         essid: str | None = None,
         deauth_rounds: int = 4,
         scan_seconds: int = 15,
+        on_scan_update=None,
+        on_capture_update=None,
+        verbose: bool = True,
     ) -> AuditResult:
-        """Run the full automated pipeline against a single target you own."""
+        """Run the full automated pipeline against a single target you own.
+
+        `verbose` prints one-line stage milestones to stderr; turn it off when a
+        live display already shows progress, to avoid fighting its redraw.
+        """
         if not self.authorized:
             raise AuthorizationError(
                 "Refusing to run without explicit authorization. Pass --authorized "
@@ -400,15 +452,73 @@ class WifiAuditor:
         self.preflight()
         self.enable_monitor()
         try:
-            bssid, channel, essid = self._resolve_target(bssid, channel, essid, scan_seconds)
-            print(f"[*] Target {bssid} (ch {channel}) — capturing handshake ...", file=sys.stderr)
+            bssid, channel, essid = self._resolve_target(
+                bssid, channel, essid, scan_seconds,
+                on_scan_update=on_scan_update, verbose=verbose,
+            )
+            if verbose:
+                print(f"[*] Target {bssid} (ch {channel}) — capturing handshake ...", file=sys.stderr)
             cap_path, captured = self.capture_handshake(
-                bssid, channel, deauth_rounds=deauth_rounds
+                bssid, channel, deauth_rounds=deauth_rounds, essid=essid,
+                on_update=on_capture_update,
             )
             key = self.crack(cap_path, bssid, wordlist) if captured else None
         finally:
             self.disable_monitor()
         return AuditResult(bssid=bssid, essid=essid, handshake_captured=captured, key=key)
+
+
+# --- live display ---------------------------------------------------------
+
+
+def render_scan_table(access_points, elapsed, total) -> str:
+    """Render a refreshing airodump-style AP table for the live display."""
+    header = f"  Scanning… {elapsed}s / {total}s      {len(access_points)} AP(s) found"
+    cols = f"  {'BSSID':<17}  {'CH':>3}  {'PWR':>4}  {'PRIVACY':<12} ESSID"
+    if not access_points:
+        return "\n".join([header, cols, "  (listening…)"])
+    rows = [
+        f"  {ap.bssid:<17}  {ap.channel:>3}  {ap.power:>4}  {ap.privacy:<12} {ap.essid}"
+        for ap in access_points
+    ]
+    return "\n".join([header, cols, *rows])
+
+
+def render_capture_status(bssid, essid, elapsed, done, total, captured) -> str:
+    """Render the live handshake-capture status block."""
+    target = f"{bssid} ({essid})" if essid else bssid
+    state = "handshake captured ✓" if captured else "handshake: waiting…"
+    return (
+        f"  Capturing handshake — {target}\n"
+        f"  elapsed {elapsed}s   deauth {done}/{total}   {state}"
+    )
+
+
+class LiveWriter:
+    """Repaints a multi-line frame in place using ANSI cursor control.
+
+    Disabled (no tty, or --quiet) it writes nothing, so piped/non-interactive
+    runs stay clean and the plain stderr milestones carry the story instead.
+    """
+
+    def __init__(self, stream=None, enabled: bool = True) -> None:
+        self._stream = stream if stream is not None else sys.stdout
+        self._enabled = enabled
+        self._lines = 0
+
+    def update(self, text: str) -> None:
+        if not self._enabled:
+            return
+        if self._lines:
+            # Move up to the start of the previous frame and clear to end.
+            self._stream.write(f"\033[{self._lines}F\033[J")
+        self._stream.write(text + "\n")
+        self._stream.flush()
+        self._lines = text.count("\n") + 1
+
+    def finish(self) -> None:
+        """Leave the last frame in place; subsequent output starts below it."""
+        self._lines = 0
 
 
 # --- CLI ------------------------------------------------------------------
@@ -438,6 +548,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not run `airmon-ng check kill` (leave NetworkManager running)",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable the live table/status display (print plain milestones only)",
+    )
+    parser.add_argument(
         "--authorized",
         action="store_true",
         help="Confirm you own or are permitted to test the target (required)",
@@ -462,6 +577,14 @@ def main(argv: list[str] | None = None) -> int:
         authorized=args.authorized,
         check_kill=not args.no_check_kill,
     )
+
+    live = (not args.quiet) and sys.stdout.isatty()
+    display = LiveWriter(enabled=live)
+    on_scan = lambda aps, elapsed, total: display.update(render_scan_table(aps, elapsed, total))
+    on_capture = lambda b, e, elapsed, done, total, got: display.update(
+        render_capture_status(b, e, elapsed, done, total, got)
+    )
+
     try:
         auditor.workdir.mkdir(parents=True, exist_ok=True)
         result = auditor.run(
@@ -471,10 +594,16 @@ def main(argv: list[str] | None = None) -> int:
             essid=args.essid,
             deauth_rounds=args.deauth_rounds,
             scan_seconds=args.scan_time,
+            on_scan_update=on_scan,
+            on_capture_update=on_capture,
+            verbose=not live,
         )
     except AutocrackError as exc:
+        display.finish()
         print(f"[!] {exc}", file=sys.stderr)
         return 1
+    finally:
+        display.finish()
 
     if not result.handshake_captured:
         print("[-] No handshake captured. Try more deauth rounds or a busier time.")

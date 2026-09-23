@@ -1,0 +1,9 @@
+README.md
+autocrack.py
+pyproject.toml
+autocrack.egg-info/PKG-INFO
+autocrack.egg-info/SOURCES.txt
+autocrack.egg-info/dependency_links.txt
+autocrack.egg-info/entry_points.txt
+autocrack.egg-info/requires.txt
+autocrack.egg-info/top_level.txt

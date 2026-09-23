@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import subprocess
 
 import pytest
@@ -9,6 +10,7 @@ from autocrack import (
     AccessPoint,
     AuthorizationError,
     InterfaceNotFoundError,
+    LiveWriter,
     MonitorModeError,
     NotRootError,
     ToolNotFoundError,
@@ -17,6 +19,8 @@ from autocrack import (
     parse_airodump_csv,
     parse_crack_key,
     parse_monitor_interface,
+    render_capture_status,
+    render_scan_table,
     scan_has_handshake,
 )
 
@@ -26,6 +30,36 @@ def _tools_present_runner(cmd, **kwargs):
     if cmd[0] == "which":
         return subprocess.CompletedProcess(cmd, 0, stdout=f"/usr/sbin/{cmd[1]}", stderr="")
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+
+class FakeClock:
+    """Monotonic-ish clock that advances a fixed step on each call."""
+
+    def __init__(self, step=5):
+        self.t = 0
+        self.step = step
+
+    def __call__(self):
+        v = self.t
+        self.t += self.step
+        return v
+
+
+class _FakeProcess:
+    """Stand-in for a backgrounded airodump-ng Popen handle."""
+
+    def __init__(self, *args, **kwargs):
+        self.terminated = False
+
+    def poll(self):
+        return None if not self.terminated else 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        self.terminated = True
+        return 0
 
 # A real `airodump-ng --output-format csv` dump (CRLF line endings, leading
 # spaces on every field) with two APs and one associated station.
@@ -272,14 +306,117 @@ def test_scan_ignores_stale_csv_from_a_previous_run(tmp_path):
     # result once the new scan finds nothing.
     (tmp_path / "scan-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
 
-    def runner(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, 1)  # airodump ran, wrote nothing new
+    def popen(cmd, **kwargs):  # airodump starts but writes nothing new
+        return _FakeProcess()
 
     auditor = WifiAuditor(
-        interface="wlan0", workdir=str(tmp_path), authorized=True, runner=runner
+        interface="wlan1",
+        workdir=str(tmp_path),
+        authorized=True,
+        popen=popen,
+        sleep=lambda _s: None,
+        clock=FakeClock(step=20),
     )
 
-    assert auditor.scan(seconds=1) == []
+    assert auditor.scan(seconds=15) == []
+
+
+def test_scan_streams_live_updates_and_returns_final_aps(tmp_path):
+    def popen(cmd, **kwargs):
+        prefix = cmd[cmd.index("--write") + 1]
+        # airodump-ng writes/refreshes its CSV while it runs.
+        pathlib.Path(f"{prefix}-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    frames = []
+    auditor = WifiAuditor(
+        interface="wlan1",
+        workdir=str(tmp_path),
+        authorized=True,
+        popen=popen,
+        sleep=lambda _s: None,
+        clock=FakeClock(step=5),
+    )
+
+    aps = auditor.scan(seconds=15, on_update=lambda a, e, t: frames.append((len(a), e, t)))
+
+    assert [ap.essid for ap in aps] == ["HomeLab", "CoffeeAP"]
+    assert frames, "expected at least one live scan frame"
+    assert frames[-1][2] == 15  # total seconds reported to the display
+
+
+def test_capture_handshake_reports_live_progress(tmp_path):
+    checks = iter(["WPA (0 handshake)", "AA:BB:CC:DD:EE:FF WPA (1 handshake)"])
+
+    def runner(cmd, **kwargs):
+        if cmd[0] == "aircrack-ng":
+            return subprocess.CompletedProcess(cmd, 0, stdout=next(checks), stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def popen(cmd, **kwargs):
+        return _FakeProcess()
+
+    frames = []
+    auditor = WifiAuditor(
+        interface="wlan1",
+        workdir=str(tmp_path),
+        authorized=True,
+        runner=runner,
+        popen=popen,
+        sleep=lambda _s: None,
+    )
+
+    cap, captured = auditor.capture_handshake(
+        "AA:BB:CC:DD:EE:FF", "6", deauth_rounds=3, essid="HomeLab",
+        on_update=lambda b, e, elapsed, done, total, got: frames.append((done, total, got)),
+    )
+
+    assert captured is True
+    assert frames  # progress was reported
+    assert frames[-1][2] is True  # final frame shows the handshake captured
+
+
+# --- live display rendering -----------------------------------------------
+
+
+def test_render_scan_table_lists_aps_and_progress():
+    aps = parse_airodump_csv(SAMPLE_AIRODUMP_CSV)
+    out = render_scan_table(aps, elapsed=7, total=15)
+
+    assert "7" in out and "15" in out
+    assert "AA:BB:CC:DD:EE:FF" in out and "HomeLab" in out
+    assert "CoffeeAP" in out
+
+
+def test_render_capture_status_shows_waiting_then_captured():
+    waiting = render_capture_status("AA:BB:CC:DD:EE:FF", "HomeLab", 12, 2, 4, captured=False)
+    assert "AA:BB:CC:DD:EE:FF" in waiting and "2" in waiting and "4" in waiting
+
+    got = render_capture_status("AA:BB:CC:DD:EE:FF", "HomeLab", 20, 3, 4, captured=True)
+    assert "captured" in got.lower() or "✓" in got
+
+
+def test_live_writer_redraws_in_place():
+    import io
+
+    buf = io.StringIO()
+    writer = LiveWriter(stream=buf, enabled=True)
+    writer.update("frame one\nline two")
+    writer.update("frame two")
+    out = buf.getvalue()
+
+    assert "frame one" in out and "frame two" in out
+    assert "\033[" in out  # used an ANSI cursor-control sequence to redraw
+
+
+def test_live_writer_is_silent_when_disabled():
+    import io
+
+    buf = io.StringIO()
+    writer = LiveWriter(stream=buf, enabled=False)
+    writer.update("nothing should appear")
+
+    assert buf.getvalue() == ""
 
 
 # --- preflight tool check -------------------------------------------------
@@ -326,24 +463,6 @@ def test_parser_accepts_full_invocation():
 
 
 # --- end-to-end orchestration with a fake runner --------------------------
-
-
-class _FakeProcess:
-    """Stand-in for a backgrounded airodump-ng Popen handle."""
-
-    def __init__(self, cap_path):
-        self._cap_path = cap_path
-        self.terminated = False
-
-    def poll(self):
-        return None if not self.terminated else 0
-
-    def terminate(self):
-        self.terminated = True
-
-    def wait(self, timeout=None):
-        self.terminated = True
-        return 0
 
 
 def test_run_captures_handshake_then_cracks_key(tmp_path):

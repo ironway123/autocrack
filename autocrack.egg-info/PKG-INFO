@@ -1,3 +1,18 @@
+Metadata-Version: 2.4
+Name: autocrack
+Version: 0.1.0
+Summary: Automated aircrack-ng Wi-Fi audit workflow for authorized testing (Linux)
+Author: ironway123
+Keywords: aircrack-ng,wifi,security,audit,wpa
+Classifier: Environment :: Console
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Security
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+
 # autocrack — automated aircrack-ng Wi-Fi audit (Linux)
 
 `autocrack` chains the [aircrack-ng](https://www.aircrack-ng.org/) suite into
@@ -30,12 +45,9 @@ directly into it.
 
 ```bash
 # 1. Install the aircrack-ng suite
-sudo apt update && sudo apt install -y aircrack-ng iw
+sudo apt update && sudo apt install -y aircrack-ng
 
-# 2. Install autocrack itself (puts an `autocrack` command on PATH)
-sudo pip install .            # from the repo root; or `pip install --user .`
-
-# 3. Plug in the ALFA (AWUS036ACHM / MT7610U) and confirm the driver bound it
+# 2. Plug in the ALFA (AWUS036ACHM / MT7610U) and confirm the driver bound it
 ip link                       # look for a wlanN interface
 sudo dmesg | grep -i mt76     # should show mt76x0u claiming the device
 
@@ -81,20 +93,19 @@ sudo python3 autocrack.py --interface wlan1 --essid <your-network> \
 
 ## Usage
 
-Run as root (monitor mode requires it). After `pip install .` you invoke it as
-`autocrack`; without installing, run `sudo python3 autocrack.py …` instead.
+Run as root (monitor mode requires it).
 
 ```bash
 # Target a specific AP you own (no scan step)
-sudo autocrack \
-    --interface wlan1 \
+sudo python3 autocrack.py \
+    --interface wlan0 \
     --bssid AA:BB:CC:DD:EE:FF --channel 6 \
     --wordlist /path/to/rockyou.txt \
     --authorized
 
 # Or scan first and target by network name
-sudo autocrack \
-    --interface wlan1 \
+sudo python3 autocrack.py \
+    --interface wlan0 \
     --essid MyHomeNetwork \
     --wordlist /path/to/rockyou.txt \
     --authorized
@@ -104,14 +115,6 @@ Without a `--bssid` or `--essid`, `autocrack` scans and then **prints the
 networks it saw and stops** — it will not attack every AP in range.
 
 Must be run as **root** (monitor mode, injection and `airmon-ng` all require it).
-
-### Live display
-
-In an interactive terminal, autocrack shows a refreshing view — an
-airodump-style table of discovered APs during the scan, then a capture-progress
-block (elapsed, deauth rounds, handshake state) — updated in place. Pass
-`--quiet` (or pipe the output to a file) to fall back to plain one-line
-milestones, which is what non-interactive/scripted runs get automatically.
 
 ### What it does, step by step
 
