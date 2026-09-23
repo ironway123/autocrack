@@ -9,6 +9,7 @@ import pytest
 import autocrack
 from autocrack import (
     AccessPoint,
+    AutocrackError,
     AuthorizationError,
     InterfaceNotFoundError,
     LiveWriter,
@@ -19,11 +20,14 @@ from autocrack import (
     build_parser,
     parse_airodump_csv,
     parse_crack_key,
+    Station,
+    parse_airodump_stations,
     parse_monitor_from_iw_dev,
     parse_monitor_interface,
     render_ap_list,
     render_capture_status,
     render_scan_table,
+    render_station_list,
     scan_has_handshake,
 )
 
@@ -453,6 +457,67 @@ def test_render_ap_list_includes_every_ap():
     out = render_ap_list(aps)
     assert "AA:BB:CC:DD:EE:FF" in out and "HomeLab" in out
     assert "11:22:33:44:55:66" in out and "CoffeeAP" in out
+
+
+# --- associated-client (station) monitoring -------------------------------
+
+
+def test_parse_airodump_stations_lists_associated_clients():
+    stations = parse_airodump_stations(SAMPLE_AIRODUMP_CSV)
+    assert stations == [
+        Station(
+            mac="99:88:77:66:55:44", power="-55", packets="30",
+            bssid="AA:BB:CC:DD:EE:FF", probes="",
+        )
+    ]
+
+
+def test_parse_airodump_stations_filters_by_bssid():
+    assert parse_airodump_stations(SAMPLE_AIRODUMP_CSV, bssid="11:22:33:44:55:66") == []
+    assert len(parse_airodump_stations(SAMPLE_AIRODUMP_CSV, bssid="aa:bb:cc:dd:ee:ff")) == 1
+
+
+def test_render_station_list_includes_client_and_its_ap():
+    stations = parse_airodump_stations(SAMPLE_AIRODUMP_CSV)
+    out = render_station_list(stations)
+    assert "99:88:77:66:55:44" in out and "AA:BB:CC:DD:EE:FF" in out
+
+
+def test_discover_clients_returns_stations_for_a_target(tmp_path):
+    def runner(cmd, **kwargs):
+        if cmd[0] == "which":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"/usr/sbin/{cmd[1]}", stderr="")
+        if cmd[:2] == ["iw", "dev"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=IW_DEV_IN_PLACE, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def popen(cmd, **kwargs):
+        prefix = cmd[cmd.index("--write") + 1]
+        pathlib.Path(f"{prefix}-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=runner, popen=popen, sleep=lambda _s: None, clock=FakeClock(step=5),
+        euid_getter=lambda: 0, net_sysfs=str(tmp_path / "nope"),
+    )
+
+    bssid, channel, stations = auditor.discover_clients(
+        scan_seconds=15, bssid="AA:BB:CC:DD:EE:FF", channel="6"
+    )
+
+    assert bssid == "AA:BB:CC:DD:EE:FF" and channel == "6"
+    assert [s.mac for s in stations] == ["99:88:77:66:55:44"]
+
+
+def test_discover_clients_requires_channel_with_bssid(tmp_path):
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=_tools_present_runner, euid_getter=lambda: 0,
+        net_sysfs=str(tmp_path / "nope"),
+    )
+    with pytest.raises(AutocrackError, match="channel"):
+        auditor.discover_clients(bssid="AA:BB:CC:DD:EE:FF")
 
 
 # --- capture retention & hashcat export -----------------------------------

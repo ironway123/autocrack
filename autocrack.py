@@ -70,6 +70,17 @@ class AccessPoint:
 
 
 @dataclass(frozen=True)
+class Station:
+    """A client (station) seen by airodump-ng, and the AP it's associated to."""
+
+    mac: str
+    power: str
+    packets: str
+    bssid: str
+    probes: str
+
+
+@dataclass(frozen=True)
 class AuditResult:
     bssid: str
     essid: str | None
@@ -118,6 +129,39 @@ _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 def _looks_like_mac(value: str) -> bool:
     return bool(_MAC_RE.match(value))
+
+
+def parse_airodump_stations(text: str, bssid: str | None = None) -> list[Station]:
+    """Parse the station (client) section of an airodump-ng CSV dump.
+
+    The section follows a blank line and a "Station MAC" header. Pass `bssid`
+    to keep only clients associated to that access point (case-insensitive).
+    """
+    stations: list[Station] = []
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Station MAC"):
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 6 or not _looks_like_mac(fields[0]):
+            continue
+        station = Station(
+            mac=fields[0],
+            power=fields[3],
+            packets=fields[4],
+            bssid=fields[5],
+            probes=fields[6] if len(fields) > 6 else "",
+        )
+        if bssid and station.bssid.lower() != bssid.lower():
+            continue
+        stations.append(station)
+    return stations
 
 
 _MONITOR_VIF_RE = re.compile(r"enabled for \[phy\d+\]\S+ on \[phy\d+\](?P<mon>\S+?)\)")
@@ -301,42 +345,87 @@ class WifiAuditor:
         `refresh` seconds and, if `on_update(aps, elapsed, total)` is given,
         stream the growing list to a live display.
         """
-        self._clear_captures("scan")
-        prefix = self.workdir / "scan"
-        csv_path = self.workdir / "scan-01.csv"
-        dump = self._popen(
-            [
-                "airodump-ng",
-                "--write", str(prefix),
-                "--output-format", "csv",
-                self.monitor or self.interface,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        cmd = [
+            "airodump-ng",
+            "--write", str(self.workdir / "scan"),
+            "--output-format", "csv",
+            self.monitor or self.interface,
+        ]
+        return self._run_airodump(
+            cmd, self.workdir / "scan-01.csv", "scan", seconds, parse_airodump_csv, on_update
         )
+
+    def _scan_stations(self, bssid, channel, seconds, on_update):
+        """Timed airodump-ng locked to one AP, parsing its associated clients."""
+        cmd = [
+            "airodump-ng",
+            "--bssid", bssid,
+            "--channel", channel,
+            "--write", str(self.workdir / "clients"),
+            "--output-format", "csv",
+            self.monitor or self.interface,
+        ]
+        return self._run_airodump(
+            cmd, self.workdir / "clients-01.csv", "clients", seconds,
+            lambda text: parse_airodump_stations(text, bssid=bssid), on_update,
+        )
+
+    def _run_airodump(self, cmd, csv_path, prefix_key, seconds, parse, on_update):
+        """Run airodump-ng in the background for `seconds`, re-parsing its CSV
+        each `refresh` interval and streaming results to `on_update`."""
+        self._clear_captures(prefix_key)
+        dump = self._popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         start = self._clock()
-        aps: list[AccessPoint] = []
+        result: list = []
         try:
             while self._clock() - start < seconds:
                 self._sleep(self._refresh)
-                aps = self._read_scan(csv_path)
+                result = self._parse_csv(csv_path, parse)
                 if on_update is not None:
-                    on_update(aps, min(int(self._clock() - start), seconds), seconds)
+                    on_update(result, min(int(self._clock() - start), seconds), seconds)
         finally:
             dump.terminate()
             try:
                 dump.wait(timeout=5)
             except Exception:
                 pass
-        aps = self._read_scan(csv_path)
+        result = self._parse_csv(csv_path, parse)
         if on_update is not None:
-            on_update(aps, seconds, seconds)
-        return aps
+            on_update(result, seconds, seconds)
+        return result
 
-    def _read_scan(self, csv_path: Path) -> list[AccessPoint]:
+    def _parse_csv(self, csv_path: Path, parse):
         if not csv_path.exists():
             return []
-        return parse_airodump_csv(csv_path.read_text(errors="replace"))
+        return parse(csv_path.read_text(errors="replace"))
+
+    def discover_clients(
+        self, scan_seconds: int = 15, bssid: str | None = None,
+        channel: str | None = None, essid: str | None = None, on_update=None,
+    ):
+        """Recon: list the clients associated to a specific AP you own.
+
+        Give a BSSID (with its channel) or an ESSID (resolved via a quick scan).
+        Returns (bssid, channel, stations). Passive: monitor + listen only, no
+        deauth/capture. Requires root; tears monitor mode back down.
+        """
+        if bssid and not channel:
+            raise AutocrackError("A channel is required with a BSSID for a client scan.")
+        if not bssid and not essid:
+            raise AutocrackError("Give a BSSID (+channel) or an ESSID to monitor clients.")
+        self.ensure_root()
+        self.preflight()
+        self.enable_monitor()
+        try:
+            if not bssid:
+                match = next((ap for ap in self.scan(seconds=scan_seconds) if ap.essid == essid), None)
+                if match is None:
+                    raise AutocrackError(f"ESSID {essid!r} was not seen in the scan.")
+                bssid, channel = match.bssid, match.channel
+            stations = self._scan_stations(bssid, channel, scan_seconds, on_update)
+            return bssid, channel, stations
+        finally:
+            self.disable_monitor()
 
     def capture_handshake(
         self,
@@ -586,6 +675,18 @@ def render_ap_list(access_points) -> str:
     return "\n".join([header, *rows])
 
 
+def render_station_list(stations) -> str:
+    """A table of associated clients (stations) for a monitored AP."""
+    header = f"  {'STATION (client)':<19}  {'PWR':>4}  {'PKTS':>6}  {'ASSOCIATED BSSID':<19} PROBES"
+    if not stations:
+        return header + "\n  (no clients seen — try scanning longer)"
+    rows = [
+        f"  {s.mac:<19}  {s.power:>4}  {s.packets:>6}  {s.bssid:<19} {s.probes}"
+        for s in stations
+    ]
+    return "\n".join([header, *rows])
+
+
 def render_capture_status(bssid, essid, elapsed, done, total, captured) -> str:
     """Render the live handshake-capture status block."""
     target = f"{bssid} ({essid})" if essid else bssid
@@ -694,17 +795,33 @@ def main(argv: list[str] | None = None) -> int:
     on_capture = lambda b, e, elapsed, done, total, got: display.update(
         render_capture_status(b, e, elapsed, done, total, got)
     )
+    on_clients = lambda sts, elapsed, total: display.update(render_station_list(sts))
 
-    # Recon mode: scan and list nearby APs, then exit. No target/wordlist/auth.
+    # Recon mode: scan and list, then exit. No wordlist/auth needed.
     if args.scan_only:
+        target = args.bssid or args.essid
         try:
             auditor.workdir.mkdir(parents=True, exist_ok=True)
-            aps = auditor.discover(scan_seconds=args.scan_time, on_update=on_scan)
+            if target:
+                # Monitor one AP and list its associated clients.
+                bssid, channel, stations = auditor.discover_clients(
+                    scan_seconds=args.scan_time, bssid=args.bssid,
+                    channel=args.channel, essid=args.essid, on_update=on_clients,
+                )
+            else:
+                aps = auditor.discover(scan_seconds=args.scan_time, on_update=on_scan)
         except AutocrackError as exc:
+            display.finish()
             print(f"[!] {exc}", file=sys.stderr)
             return 1
         finally:
             display.finish()
+
+        if target:
+            label = f"{bssid} (ch {channel})"
+            print(f"[+] {len(stations)} client(s) associated to {label}:")
+            print(render_station_list(stations))
+            return 0
         if not aps:
             print("No access points found. Move closer or scan longer.")
             return 0

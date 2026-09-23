@@ -88,6 +88,10 @@ Run as root (monitor mode requires it). After `pip install .` you invoke it as
 # Recon only — scan and list nearby APs, then exit (no target/wordlist/auth)
 sudo autocrack --interface wlan1 --scan-only
 
+# Recon on ONE AP — list the clients (stations) associated to it
+sudo autocrack --interface wlan1 --scan-only --bssid AA:BB:CC:DD:EE:FF --channel 6
+sudo autocrack --interface wlan1 --scan-only --essid HomeLab   # resolves BSSID/channel first
+
 # Target a specific AP you own (no scan step)
 sudo autocrack \
     --interface wlan1 \
@@ -108,6 +112,13 @@ prints a table of nearby APs (BSSID · channel · power · privacy · ESSID), th
 exits — no target, wordlist, or `--authorized` needed (it only listens for
 beacons). Pick a target from that list and re-run with `--bssid`/`--channel` or
 `--essid` to capture and crack.
+
+Add a target to `--scan-only` to instead **list the clients associated to one
+AP** — give `--bssid` + `--channel`, or `--essid` (its BSSID/channel are
+resolved by a quick scan first). It prints each associated station (client MAC ·
+power · packets · associated BSSID · probes). Handy for confirming a client is
+connected before capturing (deauthing an AP with no clients won't yield a
+handshake). Still passive — monitor and listen only, no deauth.
 
 In the attack path, without a `--bssid` or `--essid`, `autocrack` scans and then
 **prints the networks it saw and stops** — it will not attack every AP in range.
