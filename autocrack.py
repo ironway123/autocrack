@@ -388,7 +388,13 @@ class WifiAuditor:
         show a "press SPACE to stop" prompt rather than a countdown.
         """
         self._clear_captures(prefix_key)
-        dump = self._popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Detach airodump-ng from the terminal: it's interactive and would
+        # otherwise swallow the keystrokes (and reset the tty mode) that our
+        # spacebar-stop reader depends on for a continuous scan.
+        dump = self._popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         start = self._clock()
         total = None if stop is not None else seconds
         result: list = []
@@ -489,6 +495,7 @@ class WifiAuditor:
                 "--output-format", "pcap,csv",
                 self.monitor or self.interface,
             ],
+            stdin=subprocess.DEVNULL,  # keep airodump off our terminal
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

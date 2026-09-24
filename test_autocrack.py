@@ -723,10 +723,50 @@ def test_scan_without_stop_is_bounded_by_seconds(tmp_path):
     assert [ap.essid for ap in aps] == ["HomeLab", "CoffeeAP"]
 
 
+def test_scan_detaches_airodump_from_stdin(tmp_path):
+    # airodump-ng is interactive; if it inherits our terminal stdin it eats the
+    # spacebar keypresses that are supposed to stop a continuous scan. It must
+    # be launched with stdin detached so our keypress reader owns the terminal.
+    seen = {}
+
+    def popen(cmd, **kwargs):
+        seen.update(kwargs)
+        (tmp_path / "scan-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=lambda *a, **k: None, popen=popen, sleep=lambda _s: None,
+    )
+
+    auditor.scan(seconds=1, stop=lambda: True)
+
+    assert seen.get("stdin") is subprocess.DEVNULL
+
+
 def test_render_scan_table_prompts_for_space_when_continuous():
     out = render_scan_table([], 7, None)
     assert "SPACE" in out
     assert "/ " not in out  # no "7s / Ns" countdown in continuous mode
+
+
+def test_keypress_stop_latches_only_on_the_given_key():
+    pty = pytest.importorskip("pty")  # POSIX-only; the tool targets Linux
+    import os
+
+    master, slave = pty.openpty()
+    slave_reader = os.fdopen(slave, "r")
+    try:
+        with autocrack.keypress_stop(" ", stream=slave_reader) as check:
+            assert check() is False        # nothing pressed yet
+            os.write(master, b"x")         # an unrelated key
+            assert check() is False        # ignored
+            os.write(master, b" ")         # the spacebar
+            assert check() is True         # stops
+            assert check() is True         # latched, stays stopped
+    finally:
+        slave_reader.close()
+        os.close(master)
 
 
 # --- live display rendering -----------------------------------------------
