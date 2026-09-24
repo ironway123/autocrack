@@ -23,6 +23,7 @@ this) and must be run as root.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import os
 import re
@@ -338,12 +339,14 @@ class WifiAuditor:
             self._runner(["airmon-ng", "stop", self.monitor], capture_output=True, text=True)
             self.monitor = None
 
-    def scan(self, seconds: int = 15, on_update=None) -> list[AccessPoint]:
-        """Run a timed airodump-ng scan and parse the discovered access points.
+    def scan(self, seconds: int = 15, on_update=None, stop=None) -> list[AccessPoint]:
+        """Scan for nearby access points and parse the discovered APs.
 
         airodump-ng runs in the background writing its CSV; we re-read it every
         `refresh` seconds and, if `on_update(aps, elapsed, total)` is given,
-        stream the growing list to a live display.
+        stream the growing list to a live display. Timed for `seconds` unless a
+        `stop` predicate is given, in which case it scans continuously until
+        `stop()` returns true (see `_run_airodump`).
         """
         cmd = [
             "airodump-ng",
@@ -352,11 +355,13 @@ class WifiAuditor:
             self.monitor or self.interface,
         ]
         return self._run_airodump(
-            cmd, self.workdir / "scan-01.csv", "scan", seconds, parse_airodump_csv, on_update
+            cmd, self.workdir / "scan-01.csv", "scan", seconds, parse_airodump_csv,
+            on_update, stop=stop,
         )
 
-    def _scan_stations(self, bssid, channel, seconds, on_update):
-        """Timed airodump-ng locked to one AP, parsing its associated clients."""
+    def _scan_stations(self, bssid, channel, seconds, on_update, stop=None):
+        """airodump-ng locked to one AP, parsing its associated clients. Timed
+        for `seconds`, or continuous until `stop()` when a predicate is given."""
         cmd = [
             "airodump-ng",
             "--bssid", bssid,
@@ -368,21 +373,39 @@ class WifiAuditor:
         return self._run_airodump(
             cmd, self.workdir / "clients-01.csv", "clients", seconds,
             lambda text: parse_airodump_stations(text, bssid=bssid), on_update,
+            stop=stop,
         )
 
-    def _run_airodump(self, cmd, csv_path, prefix_key, seconds, parse, on_update):
-        """Run airodump-ng in the background for `seconds`, re-parsing its CSV
-        each `refresh` interval and streaming results to `on_update`."""
+    def _run_airodump(self, cmd, csv_path, prefix_key, seconds, parse, on_update,
+                      stop=None):
+        """Run airodump-ng in the background, re-parsing its CSV each `refresh`
+        interval and streaming results to `on_update`.
+
+        Timed by default: it runs for `seconds`, and each `on_update` reports
+        `(result, elapsed, seconds)`. When a `stop` predicate is given it runs
+        continuously instead — ignoring `seconds` and looping until `stop()`
+        returns true — and reports `(result, elapsed, None)` so the display can
+        show a "press SPACE to stop" prompt rather than a countdown.
+        """
         self._clear_captures(prefix_key)
         dump = self._popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         start = self._clock()
+        total = None if stop is not None else seconds
         result: list = []
         try:
-            while self._clock() - start < seconds:
+            while True:
+                if stop is not None:
+                    if stop():
+                        break
+                elif self._clock() - start >= seconds:
+                    break
                 self._sleep(self._refresh)
                 result = self._parse_csv(csv_path, parse)
                 if on_update is not None:
-                    on_update(result, min(int(self._clock() - start), seconds), seconds)
+                    elapsed = int(self._clock() - start)
+                    if stop is None:
+                        elapsed = min(elapsed, seconds)
+                    on_update(result, elapsed, total)
         finally:
             dump.terminate()
             try:
@@ -391,7 +414,8 @@ class WifiAuditor:
                 pass
         result = self._parse_csv(csv_path, parse)
         if on_update is not None:
-            on_update(result, seconds, seconds)
+            elapsed = seconds if stop is None else int(self._clock() - start)
+            on_update(result, elapsed, total)
         return result
 
     def _parse_csv(self, csv_path: Path, parse):
@@ -402,6 +426,7 @@ class WifiAuditor:
     def discover_clients(
         self, scan_seconds: int = 15, bssid: str | None = None,
         channel: str | None = None, essid: str | None = None, on_update=None,
+        stop=None,
     ):
         """Recon: list the clients associated to a specific AP you own.
 
@@ -422,7 +447,9 @@ class WifiAuditor:
                 if match is None:
                     raise AutocrackError(f"ESSID {essid!r} was not seen in the scan.")
                 bssid, channel = match.bssid, match.channel
-            stations = self._scan_stations(bssid, channel, scan_seconds, on_update)
+            stations = self._scan_stations(
+                bssid, channel, scan_seconds, on_update, stop=stop,
+            )
             return bssid, channel, stations
         finally:
             self.disable_monitor()
@@ -611,7 +638,7 @@ class WifiAuditor:
             + render_ap_list(access_points)
         )
 
-    def discover(self, scan_seconds: int = 15, on_update=None) -> list[AccessPoint]:
+    def discover(self, scan_seconds: int = 15, on_update=None, stop=None) -> list[AccessPoint]:
         """Recon only: enable monitor mode, scan, and return nearby APs.
 
         No target and no wordlist required, and no deauth/capture — this just
@@ -622,7 +649,7 @@ class WifiAuditor:
         self.preflight()
         self.enable_monitor()
         try:
-            return self.scan(seconds=scan_seconds, on_update=on_update)
+            return self.scan(seconds=scan_seconds, on_update=on_update, stop=stop)
         finally:
             self.disable_monitor()
 
@@ -680,8 +707,19 @@ class WifiAuditor:
 
 
 def render_scan_table(access_points, elapsed, total) -> str:
-    """Render a refreshing airodump-style AP table for the live display."""
-    header = f"  Scanning… {elapsed}s / {total}s      {len(access_points)} AP(s) found"
+    """Render a refreshing airodump-style AP table for the live display.
+
+    `total` is the scan duration for a timed scan, or None for a continuous
+    (spacebar-stopped) scan — the header then prompts for SPACE instead of
+    counting down.
+    """
+    if total is None:
+        header = (
+            f"  Scanning… {elapsed}s — press SPACE to stop"
+            f"      {len(access_points)} AP(s) found"
+        )
+    else:
+        header = f"  Scanning… {elapsed}s / {total}s      {len(access_points)} AP(s) found"
     cols = f"  {'BSSID':<17}  {'CH':>3}  {'PWR':>4}  {'PRIVACY':<12} ESSID"
     if not access_points:
         return "\n".join([header, cols, "  (listening…)"])
@@ -751,6 +789,64 @@ class LiveWriter:
         self._lines = 0
 
 
+@contextlib.contextmanager
+def keypress_stop(key: str = " ", stream=None):
+    """Yield a predicate that becomes true once `key` is pressed.
+
+    Puts the terminal in cbreak mode so a single keypress is readable without
+    Enter, and polls stdin without blocking so the caller keeps refreshing its
+    display between checks. Restores the terminal on exit. Requires a real tty
+    (a POSIX terminal); the caller decides when that's available.
+    """
+    import termios
+    import tty
+    import select
+
+    stream = stream if stream is not None else sys.stdin
+    fd = stream.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    pressed = False
+
+    def check() -> bool:
+        nonlocal pressed
+        if pressed:
+            return True
+        while select.select([stream], [], [], 0)[0]:
+            ch = stream.read(1)
+            if ch == "":  # EOF
+                break
+            if ch == key:
+                pressed = True
+                return True
+        return False
+
+    try:
+        yield check
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+@contextlib.contextmanager
+def scan_stop(interactive: bool):
+    """Yield a spacebar-stop predicate for a continuous scan when interactive,
+    or None (a plain timed scan) when there's no usable terminal."""
+    if not (interactive and sys.stdin.isatty()):
+        yield None
+        return
+    try:
+        cm = keypress_stop(" ")
+        check = cm.__enter__()
+    except Exception:
+        # No raw-terminal access (e.g. redirected stdin); fall back to timed.
+        yield None
+        return
+    try:
+        yield check
+    finally:
+        cm.__exit__(None, None, None)
+
+
 # --- CLI ------------------------------------------------------------------
 
 
@@ -772,7 +868,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bssid", help="Target AP BSSID (skip interactive scan/select)")
     parser.add_argument("--channel", help="Target AP channel (required with --bssid)")
     parser.add_argument("--essid", help="Target AP ESSID (used to auto-resolve BSSID/channel)")
-    parser.add_argument("--scan-time", type=int, default=15, help="Seconds to scan for APs")
+    parser.add_argument(
+        "--scan-time", type=int, default=15,
+        help="Scan duration in seconds for non-interactive/--quiet runs "
+             "(an interactive --scan-only scan runs until you press SPACE); "
+             "also the AP scan time on the attack path",
+    )
     parser.add_argument("--deauth-rounds", type=int, default=4, help="Deauth/capture attempts")
     parser.add_argument(
         "--deauth-count", type=int, default=5,
@@ -822,21 +923,31 @@ def main(argv: list[str] | None = None) -> int:
     on_capture = lambda b, e, elapsed, done, total, got: display.update(
         render_capture_status(b, e, elapsed, done, total, got)
     )
-    on_clients = lambda sts, elapsed, total: display.update(render_station_list(sts))
+    def on_clients(sts, elapsed, total):
+        table = render_station_list(sts)
+        if total is None:  # continuous (spacebar-stopped) scan
+            table = f"  Scanning clients… {elapsed}s — press SPACE to stop\n" + table
+        display.update(table)
 
     # Recon mode: scan and list, then exit. No wordlist/auth needed.
     if args.scan_only:
         target = args.bssid or args.essid
         try:
             auditor.workdir.mkdir(parents=True, exist_ok=True)
-            if target:
-                # Monitor one AP and list its associated clients.
-                bssid, channel, stations = auditor.discover_clients(
-                    scan_seconds=args.scan_time, bssid=args.bssid,
-                    channel=args.channel, essid=args.essid, on_update=on_clients,
-                )
-            else:
-                aps = auditor.discover(scan_seconds=args.scan_time, on_update=on_scan)
+            # Interactive recon scans run until SPACE is pressed; a non-tty or
+            # --quiet run falls back to a fixed --scan-time duration.
+            with scan_stop(live) as stop:
+                if target:
+                    # Monitor one AP and list its associated clients.
+                    bssid, channel, stations = auditor.discover_clients(
+                        scan_seconds=args.scan_time, bssid=args.bssid,
+                        channel=args.channel, essid=args.essid,
+                        on_update=on_clients, stop=stop,
+                    )
+                else:
+                    aps = auditor.discover(
+                        scan_seconds=args.scan_time, on_update=on_scan, stop=stop,
+                    )
         except AutocrackError as exc:
             display.finish()
             print(f"[!] {exc}", file=sys.stderr)

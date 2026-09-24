@@ -669,6 +669,66 @@ def test_capture_handshake_airodump_writes_pcap_and_csv(tmp_path):
     assert "pcap" in fmt and "csv" in fmt
 
 
+# --- continuous (spacebar-stopped) scan -----------------------------------
+
+
+def test_scan_runs_until_stop_signal(tmp_path):
+    # A continuous scan ignores `seconds` and keeps going until stop() is true.
+    signals = iter([False, False, True])
+    polls = []
+
+    def stop():
+        v = next(signals)
+        polls.append(v)
+        return v
+
+    def popen(cmd, **kwargs):
+        (tmp_path / "scan-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=lambda *a, **k: None, popen=popen, sleep=lambda _s: None,
+    )
+
+    aps = auditor.scan(seconds=99999, stop=stop)
+
+    assert polls == [False, False, True]  # stopped the moment stop() went true
+    assert [ap.essid for ap in aps] == ["HomeLab", "CoffeeAP"]
+
+
+def test_scan_without_stop_is_bounded_by_seconds(tmp_path):
+    # A stateful clock advancing 1s per call; timed mode must terminate.
+    class _Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            v = self.t
+            self.t += 1.0
+            return v
+
+    def popen(cmd, **kwargs):
+        (tmp_path / "scan-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=lambda *a, **k: None, popen=popen, sleep=lambda _s: None,
+        clock=_Clock(),
+    )
+
+    aps = auditor.scan(seconds=2)  # returns without hanging on the fake clock
+
+    assert [ap.essid for ap in aps] == ["HomeLab", "CoffeeAP"]
+
+
+def test_render_scan_table_prompts_for_space_when_continuous():
+    out = render_scan_table([], 7, None)
+    assert "SPACE" in out
+    assert "/ " not in out  # no "7s / Ns" countdown in continuous mode
+
+
 # --- live display rendering -----------------------------------------------
 
 
