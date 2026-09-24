@@ -1,8 +1,8 @@
 # autocrack — Handoff
 
-**Last updated:** 2026-09-23
+**Last updated:** 2026-09-24
 **Repo:** `ironway123/autocrack` (private GitHub). Local dev copy: `/Users/local/autocrack` on a macOS machine.
-**Status:** Functional. Parsing + orchestration are fully unit-tested (46 tests, all green). The offline crack path is verified against the real `aircrack-ng` binary; the live RF pipeline (monitor→scan→deauth→capture) is correct in logic and needs a real Linux + ALFA run to validate end-to-end.
+**Status:** Functional. Parsing + orchestration are fully unit-tested (49 tests, all green). The offline crack path is verified against the real `aircrack-ng` binary; the live RF pipeline (monitor→scan→deauth→capture) is correct in logic and needs a real Linux + ALFA run to validate end-to-end — including the new targeted-deauth path.
 
 This is a snapshot to resume from, not permanent docs — update or delete as work continues.
 
@@ -23,6 +23,7 @@ Kept separate from the macOS `crackiswhack` project because monitor mode / injec
 - Monitor mode via `airmon-ng`, with the monitor interface **detected from `iw dev`** (handles both in-place `wlan1` and a created `wlan1mon`).
 - **`--scan-only`** recon: list nearby APs; add `--bssid`+`--channel` or `--essid` to list the **associated clients (stations)** of one AP.
 - Targeted capture: backgrounded `airodump-ng` + `aireplay-ng` deauth, polling for the handshake. Tunable `--deauth-rounds` (default 4) and `--deauth-count` (default 5). Poll interval is 5s (hardcoded).
+- **Targeted (per-client) deauth:** the capture airodump now writes `--output-format pcap,csv`; each round re-reads that live csv and sends a `-c <station>` deauth burst to **every client currently associated** with the AP (many clients ignore broadcast deauths). Falls back to a broadcast `-a <bssid>` burst when no associated clients are visible yet. Clients that appear mid-capture get targeted on the next round.
 - **Retention:** successful captures copied to **`~/autocrack/captures/`** as `<essid>_<bssid>_<timestamp>.cap` (never clobbers); EAPOL exported to hashcat **`.hc22000`** via `hcxpcapngtool` (best-effort). Override with `--captures-dir`.
 - Offline crack via `aircrack-ng`; prints `KEY FOUND` and the saved cap/hashcat paths (even when the key isn't in the wordlist, so you can crack later).
 - **Live display** in a tty (refreshing AP/station table + capture progress); `--quiet` or a non-tty falls back to plain milestone lines.
@@ -45,6 +46,7 @@ Kept separate from the macOS `crackiswhack` project because monitor mode / injec
 - **Editable install:** switch `install.sh` to `pip install -e .` so a plain `git pull` updates the `autocrack` command (repo must stay put). Recommended.
 - **`--poll-interval`** flag (seconds between deauth rounds; currently 5s hardcoded).
 - **`--no-crack`** capture-only mode to cut Pi load (crack elsewhere). User leaning against, pending the power fix.
+- **Capture-reliability follow-ups** (identified 2026-09-24, targeted deauth done first): PMKID attack via `hcxdumptool` (gets a hash from the AP with **no clients** and bypasses PMF); detect **802.11w/PMF & WPA3** from the scan and warn that deauth won't work; longer/adaptive attack window (more rounds, a short settle before round 0); validate handshakes with `hcxpcapngtool`/`cowpatty` (M1–M4) instead of trusting aircrack's loose handshake count.
 - README section "Cracking the exports with hashcat" (commands drafted in chat: `hashcat -m 22000 <file>.hc22000 <wordlist>`, rules, masks, `--show`).
 
 ## How to run

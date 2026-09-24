@@ -448,6 +448,7 @@ class WifiAuditor:
         self._clear_captures("handshake")
         prefix = self.workdir / "handshake"
         cap_path = self.workdir / "handshake-01.cap"
+        csv_path = self.workdir / "handshake-01.csv"
         captured = False
         start = self._clock()
         dump = self._popen(
@@ -456,7 +457,9 @@ class WifiAuditor:
                 "--bssid", bssid,
                 "--channel", channel,
                 "--write", str(prefix),
-                "--output-format", "pcap",
+                # pcap holds the handshake; csv is the live station table we
+                # re-read each round to target the AP's associated clients.
+                "--output-format", "pcap,csv",
                 self.monitor or self.interface,
             ],
             stdout=subprocess.DEVNULL,
@@ -464,12 +467,7 @@ class WifiAuditor:
         )
         try:
             for round_index in range(deauth_rounds):
-                self._runner(
-                    ["aireplay-ng", "--deauth", str(deauth_count), "-a", bssid,
-                     self.monitor or self.interface],
-                    capture_output=True,
-                    text=True,
-                )
+                self._deauth_round(bssid, csv_path, deauth_count)
                 self._sleep(poll_seconds)
                 captured = self._handshake_present(cap_path, bssid)
                 if on_update is not None:
@@ -486,6 +484,35 @@ class WifiAuditor:
             except Exception:
                 pass
         return cap_path, captured
+
+    def _deauth_round(self, bssid: str, csv_path: Path, deauth_count: int) -> None:
+        """Send one round of deauths to knock clients into re-handshaking.
+
+        Prefers targeted deauths — one burst per station currently associated
+        with the AP (per airodump's live csv), since many clients ignore
+        broadcast deauth frames. Falls back to a single broadcast burst when no
+        associated clients are visible yet (e.g. the csv hasn't populated, or
+        nothing is connected).
+        """
+        iface = self.monitor or self.interface
+        stations = self._associated_stations(csv_path, bssid)
+        targets = [["-c", s.mac] for s in stations] or [[]]
+        for target in targets:
+            self._runner(
+                ["aireplay-ng", "--deauth", str(deauth_count), "-a", bssid,
+                 *target, iface],
+                capture_output=True,
+                text=True,
+            )
+
+    def _associated_stations(self, csv_path: Path, bssid: str) -> list[Station]:
+        """Clients airodump currently shows associated to bssid (empty if none
+        or the csv isn't there yet)."""
+        try:
+            text = csv_path.read_text(errors="replace")
+        except OSError:
+            return []
+        return parse_airodump_stations(text, bssid=bssid)
 
     def _clear_captures(self, prefix: str) -> None:
         """Remove leftover files from a previous run so we never read stale

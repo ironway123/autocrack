@@ -595,6 +595,80 @@ def test_capture_handshake_uses_configured_deauth_count(tmp_path):
     assert aireplay[aireplay.index("--deauth") + 1] == "12"
 
 
+def _capture_runner(calls):
+    """A fake runner that records commands and reports a captured handshake."""
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "aircrack-ng":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="AA:BB:CC:DD:EE:FF WPA (1 handshake)", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return runner
+
+
+def test_capture_handshake_targets_associated_clients(tmp_path):
+    calls = []
+
+    def popen(cmd, **kwargs):
+        # The live airodump table lists an associated client for our AP.
+        (tmp_path / "handshake-01.csv").write_text(SAMPLE_AIRODUMP_CSV)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=_capture_runner(calls), popen=popen, sleep=lambda _s: None,
+    )
+
+    auditor.capture_handshake("AA:BB:CC:DD:EE:FF", "6", deauth_rounds=1)
+
+    aireplay = next(c for c in calls if c and c[0] == "aireplay-ng")
+    assert aireplay[aireplay.index("-a") + 1] == "AA:BB:CC:DD:EE:FF"
+    # Deauth is aimed at the specific associated station, not broadcast.
+    assert aireplay[aireplay.index("-c") + 1] == "99:88:77:66:55:44"
+
+
+def test_capture_handshake_broadcasts_when_no_clients(tmp_path):
+    calls = []
+
+    def popen(cmd, **kwargs):
+        return _FakeProcess()  # no CSV written -> no associated stations
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=_capture_runner(calls), popen=popen, sleep=lambda _s: None,
+    )
+
+    auditor.capture_handshake("AA:BB:CC:DD:EE:FF", "6", deauth_rounds=1)
+
+    aireplay = next(c for c in calls if c and c[0] == "aireplay-ng")
+    assert aireplay[aireplay.index("-a") + 1] == "AA:BB:CC:DD:EE:FF"
+    assert "-c" not in aireplay  # falls back to a broadcast deauth
+
+
+def test_capture_handshake_airodump_writes_pcap_and_csv(tmp_path):
+    popened = []
+
+    def popen(cmd, **kwargs):
+        popened.append(cmd)
+        return _FakeProcess()
+
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=_capture_runner([]), popen=popen, sleep=lambda _s: None,
+    )
+
+    auditor.capture_handshake("AA:BB:CC:DD:EE:FF", "6", deauth_rounds=1)
+
+    airodump = next(c for c in popened if c and c[0] == "airodump-ng")
+    fmt = airodump[airodump.index("--output-format") + 1]
+    # A single background airodump must produce both the pcap (for the
+    # handshake) and the csv (for the live station list we target).
+    assert "pcap" in fmt and "csv" in fmt
+
+
 # --- live display rendering -----------------------------------------------
 
 
