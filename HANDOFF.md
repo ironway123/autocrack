@@ -47,7 +47,7 @@ Kept separate from the macOS `crackiswhack` project because monitor mode / injec
 - **`--poll-interval`** flag (seconds between deauth rounds; currently 5s hardcoded).
 - **`--no-crack`** capture-only mode to cut Pi load (crack elsewhere). User leaning against, pending the power fix.
 - **Capture-reliability follow-ups** (identified 2026-09-24, targeted deauth done first): PMKID attack via `hcxdumptool` (gets a hash from the AP with **no clients** and bypasses PMF); detect **802.11w/PMF & WPA3** from the scan and warn that deauth won't work; longer/adaptive attack window (more rounds, a short settle before round 0); validate handshakes with `hcxpcapngtool`/`cowpatty` (M1–M4) instead of trusting aircrack's loose handshake count.
-- README section "Cracking the exports with hashcat" (commands drafted in chat: `hashcat -m 22000 <file>.hc22000 <wordlist>`, rules, masks, `--show`).
+- ~~README section "Cracking the exports with hashcat"~~ — **done 2026-09-24** (README now has a full hashcat section: `--show`, bigger wordlists, rules, masks/`-a 3`, hybrid, `--restore`, and an incomplete-handshake sanity check).
 
 ## How to run
 

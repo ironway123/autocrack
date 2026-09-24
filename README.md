@@ -159,6 +159,62 @@ Even when the passphrase isn't in your wordlist, the saved `.cap`/`.hc22000`
 let you crack it later with a bigger list or hashcat/GPU. For the export:
 `sudo apt install -y hcxtools`. Change the location with `--captures-dir`.
 
+## Cracking the exports with hashcat
+
+autocrack's built-in crack is a single `aircrack-ng` pass over one wordlist on
+the capture host (often a slow Pi CPU). When that doesn't find the key, take the
+`.hc22000` export to a **GPU box** and run [hashcat](https://hashcat.net/hashcat/)
+in mode **22000** (WPA-PBKDF2-PMKID+EAPOL) — it's far faster and lets you apply
+rules and masks a plain wordlist can't. (`aircrack-ng` reads the `.cap`; hashcat
+reads the `.hc22000`.)
+
+First, check the hash loads and isn't already cracked:
+
+```bash
+hashcat -m 22000 capture.hc22000 --show     # prints any key already in the potfile
+```
+
+Then escalate, cheapest and most likely first:
+
+```bash
+# 1. A bigger/different wordlist (rockyou is small)
+hashcat -m 22000 capture.hc22000 weakpass.txt
+
+# 2. Wordlist + rules — mutates each word (caps, leetspeak, appended digits:
+#    Password1!, summer2023, ...). This is usually the highest-value step.
+hashcat -m 22000 capture.hc22000 rockyou.txt -r /usr/share/hashcat/rules/best64.rule
+hashcat -m 22000 capture.hc22000 rockyou.txt -r /usr/share/hashcat/rules/dive.rule
+
+# 3. Mask / brute force (-a 3) — WPA keys are >=8 chars and often structured.
+#    Very effective against default-format router passwords.
+hashcat -m 22000 capture.hc22000 -a 3 ?d?d?d?d?d?d?d?d        # 8 digits
+hashcat -m 22000 capture.hc22000 -a 3 ?u?l?l?l?l?l?d?d        # Upper+lower+2 digits
+#    ?d digit  ?l lower  ?u upper  ?s symbol  ?a all
+
+# 4. Hybrid — word + appended mask (e.g. netgear1234)
+hashcat -m 22000 capture.hc22000 -a 6 rockyou.txt ?d?d?d?d
+```
+
+Useful flags: `-w 3` (higher throughput), `-O` (optimized kernels, faster),
+`--status --status-timer=10` (live progress/ETA). hashcat auto-checkpoints —
+resume an interrupted run with `--restore`. Cracked keys are stored in the
+potfile (`~/.local/share/hashcat/hashcat.potfile`); re-run with `--show` anytime.
+
+If none of this works and the key is long and random (12+ mixed characters),
+it's effectively uncrackable by wordlist/mask — that's the correct outcome for a
+strong passphrase, not a tool failure.
+
+**If even hashcat finds nothing quickly, sanity-check the handshake is complete**
+— a capture with only EAPOL M1/M2 will never crack. Re-derive from the pcap and
+confirm it reports a written hash:
+
+```bash
+hcxpcapngtool -o check.hc22000 capture.cap
+```
+
+If it's incomplete, take a fresh capture (all four EAPOL messages) rather than
+burning GPU time on a dead handshake.
+
 ## Key options
 
 | Flag | Meaning |
