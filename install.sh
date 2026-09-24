@@ -15,7 +15,7 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 
-echo "[*] Installing dependencies (aircrack-ng, iw, python3-pip, hcxtools, hashcat)..."
+echo "[*] Installing dependencies (aircrack-ng, iw, python3-pip, hcxtools, hcxdumptool, hashcat)..."
 if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update
     $SUDO apt-get install -y aircrack-ng iw python3-pip
@@ -25,6 +25,8 @@ if command -v apt-get >/dev/null 2>&1; then
     # falls back to aircrack-ng.
     $SUDO apt-get install -y hcxtools \
         || echo "[!] hcxtools unavailable — hashcat export will be skipped."
+    $SUDO apt-get install -y hcxdumptool \
+        || echo "[!] hcxdumptool unavailable — PMKID capture will be skipped (deauth handshake still works)."
     $SUDO apt-get install -y hashcat \
         || echo "[!] hashcat unavailable — cracking will fall back to aircrack-ng."
 else

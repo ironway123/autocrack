@@ -145,20 +145,26 @@ milestones, which is what non-interactive/scripted runs get automatically.
    vif). Fails fast (rfkill / unsupported driver) instead of limping on.
 4. `airodump-ng` — timed scan; parse the CSV to resolve your target's BSSID/channel
    (skipped when you pass `--bssid`/`--channel`). Stale files from prior runs are cleared first.
-5. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.
-6. `aireplay-ng --deauth` — short deauth bursts to make a client re-handshake,
-   polling the capture until the WPA 4-way handshake appears.
-7. Retain the capture: copy the pcap to `~/autocrack/captures/` as
+5. **PMKID first (clientless).** `hcxdumptool` targets the AP and elicits EAPOL
+   M1 with a PMKID — no client and no deauth needed, so it works on idle APs and
+   past PMF/802.11w. If a PMKID appears (converted to `.hc22000` and detected),
+   it's cracked directly and the deauth path is skipped. Turn this off with
+   `--no-pmkid`, or bound it with `--pmkid-time` (default 20s). If no PMKID
+   appears, fall through to the handshake path below.
+6. `airodump-ng --bssid <t> --channel <c> -w …` — targeted capture in the background.
+7. `aireplay-ng --deauth -c <client>` — short deauth bursts to make a client
+   re-handshake, polling the capture until the WPA 4-way handshake appears.
+8. Retain the capture: copy the pcap to `~/autocrack/captures/` as
    `<essid>_<bssid>_<timestamp>.cap` (never clobbers a previous run), and, if
    `hcxpcapngtool` (hcxtools) is installed, export the EAPOL to a hashcat
    `.hc22000` next to it.
-8. Offline crack against your wordlist. **Prefers hashcat** on the `.hc22000`
+9. Offline crack against your wordlist. **Prefers hashcat** on the `.hc22000`
    (`hashcat -m 22000 <hc22000> <wordlist>`) — it's much faster and its
    hcxtools-derived handshake is more robust than aircrack-ng's own pcap
    parsing, which can run an entire wordlist and *miss* a key hashcat finds from
    the same capture. Falls back to `aircrack-ng -w <wordlist> -b <bssid> <cap>`
    when hashcat or the `.hc22000` isn't available. Prints the key.
-9. `airmon-ng stop` — tear monitor mode back down.
+10. `airmon-ng stop` — tear monitor mode back down.
 
 Even when the passphrase isn't in your wordlist, the saved `.cap`/`.hc22000`
 let you crack it later with a bigger list or hashcat/GPU. For the export:
@@ -232,6 +238,8 @@ burning GPU time on a dead handshake.
 | `--scan-time` | Seconds to scan for APs (default 15) |
 | `--deauth-rounds` | Deauth/capture attempts before giving up (default 4) |
 | `--deauth-count` | Deauth frames sent per round (default 5) |
+| `--no-pmkid` | Skip the clientless PMKID attempt; go straight to deauth capture |
+| `--pmkid-time` | Seconds to attempt PMKID before falling back (default 20) |
 | `--workdir` | Where capture files are written (default `/tmp/autocrack`) |
 | `--no-check-kill` | Don't run `airmon-ng check kill` (leave NetworkManager up) |
 

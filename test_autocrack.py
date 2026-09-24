@@ -18,6 +18,7 @@ from autocrack import (
     ToolNotFoundError,
     WifiAuditor,
     build_parser,
+    hc22000_has_pmkid,
     parse_airodump_csv,
     parse_crack_key,
     parse_hashcat_key,
@@ -676,6 +677,94 @@ def test_crack_uses_aircrack_when_no_hashcat_export(tmp_path):
     assert not any(c[0] == "hashcat" for c in calls)
 
 
+# --- PMKID capture --------------------------------------------------------
+
+
+def test_hc22000_has_pmkid_detects_pmkid_line():
+    # hashcat 22000: WPA*01* is a PMKID, WPA*02* is an EAPOL handshake.
+    assert hc22000_has_pmkid("WPA*01*deadbeef*aabbcc...\n") is True
+
+
+def test_hc22000_has_pmkid_false_for_handshake_only():
+    assert hc22000_has_pmkid("WPA*02*abcd*...\n") is False
+    assert hc22000_has_pmkid("") is False
+
+
+def _pmkid_auditor(tmp_path, runner, popen, captures):
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=runner, popen=popen, sleep=lambda _s: None,
+        captures_dir=str(captures),
+    )
+    auditor.monitor = "wlan1mon"
+    return auditor
+
+
+def test_capture_pmkid_returns_export_when_pmkid_present(tmp_path):
+    captures = tmp_path / "captures"
+    popened = []
+
+    def runner(cmd, **kwargs):
+        if cmd[0] == "hcxpcapngtool":
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("WPA*01*deadbeef*...\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def popen(cmd, **kwargs):
+        popened.append((cmd, kwargs))
+        if cmd[0] == "hcxdumptool":  # writes the pcapng it was told to
+            pathlib.Path(cmd[cmd.index("-w") + 1]).write_bytes(b"pcapng-pmkid")
+        return _FakeProcess()
+
+    auditor = _pmkid_auditor(tmp_path, runner, popen, captures)
+    pcap, hc = auditor.capture_pmkid("AA:BB:CC:DD:EE:FF", "6", essid="HomeLab", seconds=1)
+
+    assert hc and pathlib.Path(hc).exists() and pathlib.Path(hc).parent == captures
+    assert pcap and pathlib.Path(pcap).exists()
+    # hcxdumptool ran on the monitor iface, on-channel, detached from stdin.
+    dump_cmd, dump_kwargs = next((c, k) for c, k in popened if c[0] == "hcxdumptool")
+    assert "wlan1mon" in dump_cmd
+    assert dump_cmd[dump_cmd.index("-c") + 1] == "6"
+    assert dump_kwargs.get("stdin") is subprocess.DEVNULL
+    # the target BSSID was handed to hcxdumptool via a filter file
+    filt = tmp_path / "pmkid_targets.txt"
+    assert filt.exists() and "AA:BB:CC:DD:EE:FF" in filt.read_text()
+
+
+def test_capture_pmkid_returns_none_when_no_pmkid_in_capture(tmp_path):
+    captures = tmp_path / "captures"
+
+    def runner(cmd, **kwargs):
+        if cmd[0] == "hcxpcapngtool":
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("WPA*02*handshake*...\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def popen(cmd, **kwargs):
+        if cmd[0] == "hcxdumptool":
+            pathlib.Path(cmd[cmd.index("-w") + 1]).write_bytes(b"pcapng-no-pmkid")
+        return _FakeProcess()
+
+    auditor = _pmkid_auditor(tmp_path, runner, popen, captures)
+    pcap, hc = auditor.capture_pmkid("AA:BB:CC:DD:EE:FF", "6", seconds=1)
+
+    assert (pcap, hc) == (None, None)
+
+
+def test_capture_pmkid_returns_none_when_hcxdumptool_missing(tmp_path):
+    captures = tmp_path / "captures"
+
+    def popen(cmd, **kwargs):
+        if cmd[0] == "hcxdumptool":
+            raise FileNotFoundError("hcxdumptool not installed")
+        return _FakeProcess()
+
+    auditor = _pmkid_auditor(
+        tmp_path, lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""), popen, captures
+    )
+    assert auditor.capture_pmkid("AA:BB:CC:DD:EE:FF", "6", seconds=1) == (None, None)
+
+
 def test_crack_hashcat_exhausted_does_not_fall_back_to_aircrack(tmp_path):
     # hashcat ran the whole wordlist and found nothing: report no key, and do
     # NOT re-run the far slower/less reliable aircrack-ng over the same list.
@@ -956,6 +1045,16 @@ def test_parser_accepts_full_invocation():
     assert args.authorized is True
 
 
+def test_parser_pmkid_defaults_on_with_opt_out():
+    parser = build_parser()
+    default = parser.parse_args(["--interface", "wlan0", "--wordlist", "/w", "--authorized"])
+    assert default.no_pmkid is False
+    off = parser.parse_args(
+        ["--interface", "wlan0", "--wordlist", "/w", "--authorized", "--no-pmkid"]
+    )
+    assert off.no_pmkid is True
+
+
 # --- end-to-end orchestration with a fake runner --------------------------
 
 
@@ -1019,7 +1118,7 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
 
     result = auditor.run(
         bssid="AA:BB:CC:DD:EE:FF", channel="6", essid="HomeLab",
-        wordlist=str(wordlist), deauth_rounds=2,
+        wordlist=str(wordlist), deauth_rounds=2, pmkid=False,
     )
 
     assert result.handshake_captured is True
@@ -1031,3 +1130,96 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
     assert result.capture_path and pathlib.Path(result.capture_path).exists()
     assert pathlib.Path(result.capture_path).parent == captures
     assert result.hashcat_path and pathlib.Path(result.hashcat_path).exists()
+
+
+def _base_run_runner(tmp_path, calls, handshake_checks, pmkid_line):
+    """Fake runner for full-run tests: root/preflight/monitor + configurable
+    hcxpcapngtool output (pmkid_line controls whether a PMKID appears)."""
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        prog = cmd[0]
+        if prog == "which":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"/usr/sbin/{cmd[1]}", stderr="")
+        if prog == "airmon-ng" and cmd[1] == "start":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["iw", "dev"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="phy#0\n\tInterface wlan1mon\n\t\ttype monitor\n", stderr=""
+            )
+        if prog == "hcxpcapngtool":
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text(pmkid_line)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if prog == "hashcat" and "--show" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="correcthorse\n", stderr="")
+        if prog == "aircrack-ng":  # handshake presence check
+            return subprocess.CompletedProcess(cmd, 0, stdout=next(handshake_checks), stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return runner
+
+
+def test_run_prefers_pmkid_and_skips_deauth_when_pmkid_captured(tmp_path):
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("correcthorse\n")
+    calls = []
+    runner = _base_run_runner(tmp_path, calls, iter([]), "WPA*01*pmkid*...\n")
+
+    def popen(cmd, **kwargs):
+        if cmd[0] == "hcxdumptool":  # PMKID capture writes a pcapng
+            pathlib.Path(cmd[cmd.index("-w") + 1]).write_bytes(b"pcapng-pmkid")
+        return _FakeProcess()
+
+    captures = tmp_path / "captures"
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=runner, popen=popen, sleep=lambda _s: None,
+        euid_getter=lambda: 0, captures_dir=str(captures),
+    )
+
+    result = auditor.run(
+        bssid="AA:BB:CC:DD:EE:FF", channel="6", essid="HomeLab",
+        wordlist=str(wordlist),
+    )
+
+    assert result.pmkid_captured is True
+    assert result.handshake_captured is False
+    assert result.key == "correcthorse"
+    # No deauth was sent — PMKID is clientless.
+    assert not any(c and c[0] == "aireplay-ng" for c in calls)
+    assert result.hashcat_path and pathlib.Path(result.hashcat_path).exists()
+
+
+def test_run_falls_back_to_handshake_when_no_pmkid(tmp_path):
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("correcthorse\n")
+    calls = []
+    checks = iter(["WPA (0 handshake)", "AA:BB:CC:DD:EE:FF WPA (1 handshake)"])
+    # hcxpcapngtool yields only an EAPOL line (no PMKID) -> PMKID attempt fails.
+    runner = _base_run_runner(tmp_path, calls, checks, "WPA*02*handshake*...\n")
+
+    def popen(cmd, **kwargs):
+        if cmd[0] == "hcxdumptool":
+            pathlib.Path(cmd[cmd.index("-w") + 1]).write_bytes(b"pcapng-no-pmkid")
+        if "--write" in cmd:  # airodump handshake capture
+            prefix = cmd[cmd.index("--write") + 1]
+            if "handshake" in prefix:
+                pathlib.Path(f"{prefix}-01.cap").write_bytes(b"pcap-eapol")
+        return _FakeProcess()
+
+    captures = tmp_path / "captures"
+    auditor = WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=runner, popen=popen, sleep=lambda _s: None,
+        euid_getter=lambda: 0, captures_dir=str(captures),
+    )
+
+    result = auditor.run(
+        bssid="AA:BB:CC:DD:EE:FF", channel="6", essid="HomeLab",
+        wordlist=str(wordlist), deauth_rounds=2,
+    )
+
+    assert result.pmkid_captured is False
+    assert result.handshake_captured is True   # fell back and captured a handshake
+    assert result.key == "correcthorse"
+    assert any(c and c[0] == "aireplay-ng" for c in calls)  # deauth did run on fallback

