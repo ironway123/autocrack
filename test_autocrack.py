@@ -20,6 +20,7 @@ from autocrack import (
     build_parser,
     parse_airodump_csv,
     parse_crack_key,
+    parse_hashcat_key,
     Station,
     parse_airodump_stations,
     parse_monitor_from_iw_dev,
@@ -167,6 +168,15 @@ def test_parse_crack_key_returns_none_when_not_found():
     output = "Passphrase not in dictionary\nQuitting aircrack-ng...\n"
 
     assert parse_crack_key(output) is None
+
+
+def test_parse_hashcat_key_returns_the_plain_password():
+    # `hashcat --show --outfile-format 2` prints just the password per line.
+    assert parse_hashcat_key("s3cretpass\n") == "s3cretpass"
+
+
+def test_parse_hashcat_key_returns_none_when_empty():
+    assert parse_hashcat_key("\n\n") is None
 
 
 # --- authorization guard --------------------------------------------------
@@ -595,6 +605,97 @@ def test_capture_handshake_uses_configured_deauth_count(tmp_path):
     assert aireplay[aireplay.index("--deauth") + 1] == "12"
 
 
+# --- crack: hashcat preferred, aircrack-ng fallback -----------------------
+
+
+def _crack_auditor(tmp_path, runner):
+    return WifiAuditor(
+        interface="wlan1", workdir=str(tmp_path), authorized=True,
+        runner=runner, popen=lambda *a, **k: _FakeProcess(), sleep=lambda _s: None,
+    )
+
+
+def test_crack_prefers_hashcat_when_hc22000_available(tmp_path):
+    # hashcat cracks the .hc22000 more reliably than aircrack-ng cracks the
+    # pcap, so when we have an export and hashcat is present, use it (and don't
+    # touch aircrack-ng).
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "hashcat" and "--show" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="hunter2hunter\n", stderr="")
+        if cmd[0] == "hashcat":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"aircrack-ng must not run: {cmd}")
+
+    key = _crack_auditor(tmp_path, runner).crack(
+        tmp_path / "h.cap", "AA:BB:CC:DD:EE:FF", "/wl",
+        hashcat_path=str(tmp_path / "h.hc22000"),
+    )
+
+    assert key == "hunter2hunter"
+    assert any(c[0] == "hashcat" for c in calls)
+    assert not any(c[0] == "aircrack-ng" for c in calls)
+
+
+def test_crack_falls_back_to_aircrack_when_hashcat_not_installed(tmp_path):
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "hashcat":
+            raise FileNotFoundError("hashcat not installed")
+        if cmd[0] == "aircrack-ng":
+            return subprocess.CompletedProcess(cmd, 0, stdout="KEY FOUND! [ letmein12 ]", stderr="")
+        raise AssertionError(f"unexpected: {cmd}")
+
+    key = _crack_auditor(tmp_path, runner).crack(
+        tmp_path / "h.cap", "AA:BB:CC:DD:EE:FF", "/wl",
+        hashcat_path=str(tmp_path / "h.hc22000"),
+    )
+
+    assert key == "letmein12"
+    assert any(c[0] == "aircrack-ng" for c in calls)
+
+
+def test_crack_uses_aircrack_when_no_hashcat_export(tmp_path):
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "aircrack-ng":
+            return subprocess.CompletedProcess(cmd, 0, stdout="KEY FOUND! [ abcdefgh ]", stderr="")
+        raise AssertionError(f"hashcat must not run without an export: {cmd}")
+
+    key = _crack_auditor(tmp_path, runner).crack(
+        tmp_path / "h.cap", "AA:BB:CC:DD:EE:FF", "/wl",  # no hashcat_path
+    )
+
+    assert key == "abcdefgh"
+    assert not any(c[0] == "hashcat" for c in calls)
+
+
+def test_crack_hashcat_exhausted_does_not_fall_back_to_aircrack(tmp_path):
+    # hashcat ran the whole wordlist and found nothing: report no key, and do
+    # NOT re-run the far slower/less reliable aircrack-ng over the same list.
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "hashcat":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        raise AssertionError(f"aircrack-ng must not run after hashcat ran: {cmd}")
+
+    key = _crack_auditor(tmp_path, runner).crack(
+        tmp_path / "h.cap", "AA:BB:CC:DD:EE:FF", "/wl",
+        hashcat_path=str(tmp_path / "h.hc22000"),
+    )
+
+    assert key is None
+    assert not any(c[0] == "aircrack-ng" for c in calls)
+
+
 def _capture_runner(calls):
     """A fake runner that records commands and reports a captured handshake."""
 
@@ -883,11 +984,11 @@ def test_run_captures_handshake_then_cracks_key(tmp_path):
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
         if prog == "aireplay-ng":
             return subprocess.CompletedProcess(cmd, 0, stdout="Sending DeAuth", stderr="")
-        if prog == "aircrack-ng" and "-w" in cmd:  # final crack
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout="KEY FOUND! [ correcthorse ]", stderr=""
-            )
-        if prog == "aircrack-ng":  # handshake presence check
+        if prog == "hashcat" and "--show" in cmd:  # read back the cracked key
+            return subprocess.CompletedProcess(cmd, 0, stdout="correcthorse\n", stderr="")
+        if prog == "hashcat":  # the crack run itself
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if prog == "aircrack-ng":  # handshake presence check (crack goes via hashcat)
             return subprocess.CompletedProcess(cmd, 0, stdout=next(handshake_checks), stderr="")
         if prog == "hcxpcapngtool":
             out = cmd[cmd.index("-o") + 1]

@@ -235,6 +235,18 @@ def parse_crack_key(aircrack_output: str) -> str | None:
     return match.group("key") if match else None
 
 
+def parse_hashcat_key(show_output: str) -> str | None:
+    """Return the passphrase from `hashcat --show --outfile-format 2` output.
+
+    Format 2 is the plain password, one per line; take the first non-empty one.
+    """
+    for line in show_output.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
 # --- orchestration --------------------------------------------------------
 
 
@@ -600,7 +612,44 @@ class WifiAuditor:
             return None
         return str(out)
 
-    def crack(self, cap_path: Path, bssid: str, wordlist: str) -> str | None:
+    def crack(self, cap_path: Path, bssid: str, wordlist: str,
+              hashcat_path: str | None = None) -> str | None:
+        """Crack the captured handshake against `wordlist`.
+
+        Prefers hashcat on the `.hc22000` export when one is available: it's far
+        faster and its hcxtools-derived handshake is more robust than
+        aircrack-ng's own pcap parsing, which can churn through an entire
+        wordlist and miss a key that hashcat finds from the same capture. Falls
+        back to `aircrack-ng` on the pcap only when there's no export or hashcat
+        isn't installed. If hashcat ran and found nothing, we return no key
+        rather than re-running the slower cracker over the same list.
+        """
+        if hashcat_path:
+            try:
+                return self._crack_hashcat(hashcat_path, wordlist)
+            except FileNotFoundError:
+                pass  # hashcat not installed; fall back to aircrack-ng
+        return self._crack_aircrack(cap_path, bssid, wordlist)
+
+    def _crack_hashcat(self, hashcat_path: str, wordlist: str) -> str | None:
+        """Run hashcat (mode 22000) over the wordlist, then read back the key.
+
+        Raises FileNotFoundError if hashcat isn't installed (so `crack` can fall
+        back). stdin is detached so hashcat can't grab the terminal.
+        """
+        self._runner(
+            ["hashcat", "-m", "22000", "--quiet", hashcat_path, wordlist],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        # --show reads the potfile, so it reports the key whether it was cracked
+        # just now or on an earlier run.
+        shown = self._runner(
+            ["hashcat", "-m", "22000", "--show", "--outfile-format", "2", hashcat_path],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        return parse_hashcat_key(shown.stdout)
+
+    def _crack_aircrack(self, cap_path: Path, bssid: str, wordlist: str) -> str | None:
         completed = self._runner(
             ["aircrack-ng", "-w", wordlist, "-b", bssid, str(cap_path)],
             capture_output=True,
@@ -701,7 +750,10 @@ class WifiAuditor:
             saved_cap = hashcat_path = None
             if captured:
                 saved_cap, hashcat_path = self._archive_capture(cap_path, bssid, essid)
-            key = self.crack(cap_path, bssid, wordlist) if captured else None
+            key = (
+                self.crack(cap_path, bssid, wordlist, hashcat_path=hashcat_path)
+                if captured else None
+            )
         finally:
             self.disable_monitor()
         return AuditResult(

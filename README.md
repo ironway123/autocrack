@@ -152,7 +152,12 @@ milestones, which is what non-interactive/scripted runs get automatically.
    `<essid>_<bssid>_<timestamp>.cap` (never clobbers a previous run), and, if
    `hcxpcapngtool` (hcxtools) is installed, export the EAPOL to a hashcat
    `.hc22000` next to it.
-8. `aircrack-ng -w <wordlist> -b <bssid> <cap>` — offline crack; prints the key.
+8. Offline crack against your wordlist. **Prefers hashcat** on the `.hc22000`
+   (`hashcat -m 22000 <hc22000> <wordlist>`) — it's much faster and its
+   hcxtools-derived handshake is more robust than aircrack-ng's own pcap
+   parsing, which can run an entire wordlist and *miss* a key hashcat finds from
+   the same capture. Falls back to `aircrack-ng -w <wordlist> -b <bssid> <cap>`
+   when hashcat or the `.hc22000` isn't available. Prints the key.
 9. `airmon-ng stop` — tear monitor mode back down.
 
 Even when the passphrase isn't in your wordlist, the saved `.cap`/`.hc22000`

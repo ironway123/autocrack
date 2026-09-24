@@ -15,13 +15,18 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 
-echo "[*] Installing dependencies (aircrack-ng, iw, python3-pip)..."
+echo "[*] Installing dependencies (aircrack-ng, iw, python3-pip, hcxtools, hashcat)..."
 if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update
     $SUDO apt-get install -y aircrack-ng iw python3-pip
-    # hcxtools is optional (enables the hashcat .hc22000 export).
+    # hcxtools + hashcat are optional but strongly recommended: they enable the
+    # preferred crack path (hashcat on the .hc22000), which is far faster and
+    # more reliable than aircrack-ng's pcap cracking. Without them autocrack
+    # falls back to aircrack-ng.
     $SUDO apt-get install -y hcxtools \
         || echo "[!] hcxtools unavailable — hashcat export will be skipped."
+    $SUDO apt-get install -y hashcat \
+        || echo "[!] hashcat unavailable — cracking will fall back to aircrack-ng."
 else
     echo "[!] apt-get not found — install aircrack-ng, iw and pip yourself."
 fi

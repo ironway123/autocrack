@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-09-24
 **Repo:** `ironway123/autocrack` (private GitHub). Local dev copy: `/Users/local/autocrack` on a macOS machine.
-**Status:** Functional. Parsing + orchestration are fully unit-tested (54 tests, all green). The offline crack path is verified against the real `aircrack-ng` binary; the live RF pipeline (monitor→scan→deauth→capture) is correct in logic and needs a real Linux + ALFA run to validate end-to-end — including the new targeted-deauth path.
+**Status:** Functional. Parsing + orchestration are fully unit-tested (60 tests, all green). The offline crack path is verified against the real `aircrack-ng` binary; the live RF pipeline (monitor→scan→deauth→capture) is correct in logic and needs a real Linux + ALFA run to validate end-to-end — including the new targeted-deauth path.
 
 This is a snapshot to resume from, not permanent docs — update or delete as work continues.
 
@@ -25,7 +25,7 @@ Kept separate from the macOS `crackiswhack` project because monitor mode / injec
 - Targeted capture: backgrounded `airodump-ng` + `aireplay-ng` deauth, polling for the handshake. Tunable `--deauth-rounds` (default 4) and `--deauth-count` (default 5). Poll interval is 5s (hardcoded).
 - **Targeted (per-client) deauth:** the capture airodump now writes `--output-format pcap,csv`; each round re-reads that live csv and sends a `-c <station>` deauth burst to **every client currently associated** with the AP (many clients ignore broadcast deauths). Falls back to a broadcast `-a <bssid>` burst when no associated clients are visible yet. Clients that appear mid-capture get targeted on the next round.
 - **Retention:** successful captures copied to **`~/autocrack/captures/`** as `<essid>_<bssid>_<timestamp>.cap` (never clobbers); EAPOL exported to hashcat **`.hc22000`** via `hcxpcapngtool` (best-effort). Override with `--captures-dir`.
-- Offline crack via `aircrack-ng`; prints `KEY FOUND` and the saved cap/hashcat paths (even when the key isn't in the wordlist, so you can crack later).
+- Offline crack: **hashcat-preferred, aircrack-ng fallback** (added 2026-09-24). When a `.hc22000` export and `hashcat` exist, `crack()` runs `hashcat -m 22000 <hc22000> <wordlist>` then `hashcat --show --outfile-format 2` to read the key; otherwise it falls back to `aircrack-ng -w … -b <bssid> <cap>`. If hashcat ran and found nothing it returns no key (doesn't re-run the slower aircrack over the same list). **Why:** a real bug — on one host, aircrack-ng ran a full wordlist and reported no key while hashcat cracked the same handshake+wordlist in 30s. Root cause: aircrack-ng's pcap handshake/EAPOL handling is less robust than hcxtools+hashcat, so it can churn the whole list and miss a present key. hashcat/hcxtools also power the `--show`/mask/rule workflow in the README. `install.sh` now installs `hashcat` (best-effort). Still prints the saved cap/hashcat paths even when no key is found, so you can crack later. Both crack paths use fake runners in tests; real hashcat integration wants a run on the box.
 - **Live display** in a tty (refreshing AP/station table + capture progress); `--quiet` or a non-tty falls back to plain milestone lines.
 - **Safety:** `--authorized` required for the attack path; `--scan-only` needs only root (passive); refuses to auto-attack every AP; requires root; preflights required tools and interface existence.
 - **Packaging:** `pyproject.toml` console entry point (`autocrack`); `install.sh` installs system-wide and handles Bookworm's PEP 668 (`--break-system-packages`).
