@@ -1029,10 +1029,81 @@ def test_preflight_passes_when_all_tools_present():
 # --- CLI parser -----------------------------------------------------------
 
 
-def test_parser_requires_interface_and_wordlist():
+def test_parser_interface_optional_for_autodetect():
     parser = build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args([])
+    args = parser.parse_args(["--wordlist", "/w", "--authorized"])
+    assert args.interface is None  # omitted -> auto-detect a USB adapter at runtime
+
+
+# --- adapter auto-detection ------------------------------------------------
+
+
+def _fake_iface(net, name, driver):
+    import os
+    dev = net / name / "device"
+    dev.mkdir(parents=True)
+    os.symlink(f"/sys/bus/usb/drivers/{driver}", dev / "driver")
+
+
+def test_resolve_interface_autodetects_monitor_adapter(tmp_path):
+    net = tmp_path / "net"
+    net.mkdir()
+    _fake_iface(net, "wlan0", "brcmfmac")   # Pi built-in Wi-Fi
+    _fake_iface(net, "wlan1", "mt76x0u")    # the ALFA
+    auditor = WifiAuditor(
+        interface=None, workdir=str(tmp_path), authorized=True, net_sysfs=str(net)
+    )
+
+    assert auditor.resolve_interface() == "wlan1"
+    assert auditor.interface == "wlan1"
+
+
+def test_resolve_interface_detects_other_known_usb_adapters(tmp_path):
+    net = tmp_path / "net"
+    net.mkdir()
+    _fake_iface(net, "wlan0", "brcmfmac")
+    _fake_iface(net, "wlan1", "rtl8812au")  # a different common monitor adapter
+    auditor = WifiAuditor(
+        interface=None, workdir=str(tmp_path), authorized=True, net_sysfs=str(net)
+    )
+
+    assert auditor.resolve_interface() == "wlan1"
+
+
+def test_resolve_interface_errors_when_no_adapter(tmp_path):
+    net = tmp_path / "net"
+    net.mkdir()
+    _fake_iface(net, "wlan0", "brcmfmac")
+    auditor = WifiAuditor(
+        interface=None, workdir=str(tmp_path), authorized=True, net_sysfs=str(net)
+    )
+
+    with pytest.raises(InterfaceNotFoundError):
+        auditor.resolve_interface()
+
+
+def test_resolve_interface_errors_when_multiple_adapters(tmp_path):
+    net = tmp_path / "net"
+    net.mkdir()
+    _fake_iface(net, "wlan1", "mt76x0u")
+    _fake_iface(net, "wlan2", "rtl8812au")
+    auditor = WifiAuditor(
+        interface=None, workdir=str(tmp_path), authorized=True, net_sysfs=str(net)
+    )
+
+    with pytest.raises(InterfaceNotFoundError):
+        auditor.resolve_interface()
+
+
+def test_resolve_interface_keeps_an_explicit_choice(tmp_path):
+    net = tmp_path / "net"
+    net.mkdir()
+    _fake_iface(net, "wlan1", "mt76x0u")
+    auditor = WifiAuditor(
+        interface="wlan9", workdir=str(tmp_path), authorized=True, net_sysfs=str(net)
+    )
+
+    assert auditor.resolve_interface() == "wlan9"  # named interface wins, no autodetect
 
 
 def test_parser_accepts_full_invocation():

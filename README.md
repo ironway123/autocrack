@@ -57,9 +57,12 @@ A Pi (4/5, or a Zero 2 W) running Raspberry Pi OS or Kali is the recommended
 host. No code changes are needed — but four things bite people:
 
 1. **The ALFA is `wlan1`, not `wlan0`.** `wlan0` is the Pi's built-in Wi-Fi;
-   the AWUS036ACHM comes up as `wlan1`. Pass `--interface wlan1`. Confirm with
-   `iw dev` after plugging it in. (autocrack now fails preflight with a clear
-   message if you name an interface that doesn't exist.)
+   the AWUS036ACHM comes up as `wlan1`. You can pass `--interface wlan1`, or
+   **omit `--interface` and autocrack auto-detects the ALFA** by its driver
+   (`mt76x0u`, and other common monitor-capable USB adapters) — it fails with a
+   clear message if none, or several, are found. Confirm with `iw dev` after
+   plugging it in. (autocrack also fails preflight clearly if you name an
+   interface that doesn't exist.)
 2. **Don't SSH in over Wi-Fi.** autocrack runs `airmon-ng check kill` by
    default, which stops NetworkManager/wpa_supplicant and **drops a Wi-Fi SSH
    session**. Reach the Pi over **Ethernet** or a serial/HDMI console. If you
@@ -86,6 +89,9 @@ Run as root (monitor mode requires it). After `pip install .` you invoke it as
 `autocrack`; without installing, run `sudo python3 autocrack.py …` instead.
 
 ```bash
+# Auto-detect the ALFA (omit --interface) — scan and list nearby APs
+sudo autocrack --scan-only
+
 # Recon only — scan and list nearby APs, then exit (no target/wordlist/auth)
 sudo autocrack --interface wlan1 --scan-only
 
@@ -230,7 +236,7 @@ burning GPU time on a dead handshake.
 
 | Flag | Meaning |
 |------|---------|
-| `--interface` | Wi-Fi interface (e.g. `wlan0`) — **required** |
+| `--interface` | Wi-Fi interface (e.g. `wlan1`). **Omit to auto-detect** a monitor-capable USB adapter (e.g. the ALFA) by its driver |
 | `--wordlist` | Passphrase wordlist — **required** |
 | `--authorized` | Confirm you're permitted to test the target — **required to run** |
 | `--bssid` / `--channel` | Target AP directly, skipping the scan |

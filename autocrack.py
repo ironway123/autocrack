@@ -36,6 +36,22 @@ from pathlib import Path
 
 REQUIRED_TOOLS = ("airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng")
 
+# Kernel drivers of common monitor-mode/injection-capable USB Wi-Fi adapters,
+# used to auto-detect an adapter (e.g. the ALFA) when no --interface is named.
+# mt76x0u is the AWUS036ACHM (MT7610U); the rest cover other frequent adapters.
+MONITOR_CAPABLE_DRIVERS = frozenset({
+    "mt76x0u",    # ALFA AWUS036ACHM (MT7610U)
+    "mt76x2u",    # ALFA AWUS036ACM (MT7612U)
+    "mt7601u",    # older MediaTek USB
+    "rt2800usb",  # ALFA AWUS036NH / Ralink
+    "rtl8812au",  # ALFA AWUS036ACH (RTL8812AU)
+    "rtl8814au",  # ALFA AWUS1900 (RTL8814AU)
+    "rtl88xxau",  # aircrack-ng driver package variant name
+    "rtl8187",    # ALFA AWUS036H (legacy)
+    "ath9k_htc",  # ALFA AWUS036NHA (AR9271)
+    "carl9170",   # AR9170 USB
+})
+
 
 class AutocrackError(RuntimeError):
     """Base error for autocrack failures."""
@@ -304,8 +320,53 @@ class WifiAuditor:
         if self._euid_getter() != 0:
             raise NotRootError("autocrack must be run as root (e.g. with sudo).")
 
+    def resolve_interface(self) -> str:
+        """Return the interface to use, auto-detecting one when none was named.
+
+        With no `--interface` (self.interface is None or "auto"), find a
+        monitor-capable USB adapter (e.g. the ALFA) by its kernel driver, so the
+        card is used automatically when it's the only one plugged in. An
+        explicitly named interface always wins and skips detection. Sets and
+        returns self.interface.
+        """
+        if self.interface and self.interface != "auto":
+            return self.interface
+        found = self._detect_adapters()
+        if not found:
+            raise InterfaceNotFoundError(
+                "No monitor-capable USB Wi-Fi adapter auto-detected. Plug in the "
+                "ALFA (check `iw dev` / `dmesg | grep mt76`), or name one with "
+                "--interface."
+            )
+        if len(found) > 1:
+            raise InterfaceNotFoundError(
+                "Multiple monitor-capable adapters found (" + ", ".join(found) +
+                "); choose one with --interface."
+            )
+        self.interface = found[0]
+        return self.interface
+
+    def _detect_adapters(self) -> list[str]:
+        """Names of interfaces whose driver is a known monitor-capable USB one."""
+        if not self._net_sysfs.exists():
+            return []
+        found = []
+        for iface_dir in sorted(self._net_sysfs.iterdir()):
+            if self._interface_driver(iface_dir.name) in MONITOR_CAPABLE_DRIVERS:
+                found.append(iface_dir.name)
+        return found
+
+    def _interface_driver(self, iface: str) -> str | None:
+        """The kernel driver bound to `iface`, via /sys/class/net/<iface>/device/driver."""
+        try:
+            target = os.readlink(self._net_sysfs / iface / "device" / "driver")
+        except OSError:
+            return None
+        return os.path.basename(target)
+
     def preflight(self) -> None:
         """Ensure the aircrack-ng suite is installed and the interface exists."""
+        self.resolve_interface()
         for tool in REQUIRED_TOOLS:
             completed = self._runner(["which", tool], capture_output=True, text=True)
             if completed.returncode != 0:
@@ -1014,7 +1075,11 @@ def build_parser() -> argparse.ArgumentParser:
             "crack) for AUTHORIZED Wi-Fi audits on Linux."
         ),
     )
-    parser.add_argument("--interface", required=True, help="Wi-Fi interface, e.g. wlan0")
+    parser.add_argument(
+        "--interface",
+        help="Wi-Fi interface (e.g. wlan1). Omit to auto-detect a monitor-capable "
+             "USB adapter such as the ALFA (fails if none or several are found).",
+    )
     parser.add_argument("--wordlist", help="Path to a passphrase wordlist (required unless --scan-only)")
     parser.add_argument(
         "--scan-only",
